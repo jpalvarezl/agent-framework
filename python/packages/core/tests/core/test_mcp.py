@@ -11,6 +11,7 @@ import warnings
 from contextlib import AbstractAsyncContextManager, _AsyncGeneratorContextManager  # type: ignore
 from contextvars import ContextVar
 from datetime import timedelta
+from textwrap import dedent
 from types import TracebackType
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -8312,6 +8313,84 @@ async def test_mcp_streamable_http_tool_connects_to_legacy_server() -> None:
     assert "server/discover" in captured_methods
     assert "initialize" in captured_methods
     assert "tools/list" in captured_methods
+
+
+@pytest.mark.parametrize(
+    ("era", "expected_version"),
+    [
+        ("modern", "2026-07-28"),
+        ("legacy", "2025-11-25"),
+    ],
+)
+async def test_mcp_stdio_tool_connects_to_both_protocol_eras(era: str, expected_version: str) -> None:
+    server_script = dedent(
+        """
+        import json
+        import sys
+
+        era = sys.argv[1]
+        for line in sys.stdin:
+            request = json.loads(line)
+            if "id" not in request:
+                continue
+
+            request_id = request["id"]
+            method = request["method"]
+            result = None
+            error = None
+
+            if method == "server/discover":
+                if era == "modern":
+                    result = {
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                    }
+                else:
+                    error = {"code": -32601, "message": "Method not found"}
+            elif method == "initialize":
+                if era == "legacy":
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "legacy-test-server", "version": "1.0"},
+                    }
+                else:
+                    error = {"code": -32601, "message": "Method not found"}
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = {
+                    "tools": [{"name": "greet", "inputSchema": {"type": "object", "properties": {}}}],
+                }
+                if era == "modern":
+                    result.update({"resultType": "complete", "cacheScope": "private", "ttlMs": 0})
+            elif method == "tools/call":
+                result = {
+                    "content": [{"type": "text", "text": "Hello!"}],
+                    "isError": False,
+                }
+                if era == "modern":
+                    result["resultType"] = "complete"
+            else:
+                error = {"code": -32601, "message": f"Unexpected method: {method}"}
+
+            response = {"jsonrpc": "2.0", "id": request_id}
+            response["error" if error is not None else "result"] = error if error is not None else result
+            print(json.dumps(response), flush=True)
+        """
+    )
+    tool = MCPStdioTool(
+        name=f"{era}-stdio",
+        command=sys.executable,
+        args=["-c", server_script, era],
+        load_prompts=False,
+    )
+
+    async with tool:
+        assert tool.session is not None
+        assert tool.session.protocol_version == expected_version
+        assert [function.name for function in tool.functions] == ["greet"]
+        assert _mcp_result_to_text(await tool.call_tool("greet")) == "Hello!"
 
 
 async def test_agent_context_manager_authenticates_connect_with_closure_provider(
