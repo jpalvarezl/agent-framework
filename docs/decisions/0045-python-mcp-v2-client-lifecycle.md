@@ -54,8 +54,9 @@ For framework-created connections:
 - Negotiated protocol version and server capabilities are read from the client's era-neutral properties rather than
   captured only from an initialize result.
 - Tools configured for the existing server-initiated sampling callback use `mode="legacy"`. The MCP migration guide
-  requires legacy mode for that back-channel behavior because 2026-07-28 refuses server-initiated sampling on every
-  transport. Auto mode remains the default when no legacy-only callback behavior is requested.
+  advises legacy mode for workflows that rely on that back-channel behavior because 2026-07-28 refuses
+  server-initiated sampling on every transport. Auto mode remains the default when no legacy-only callback behavior
+  is requested.
 
 Agent Framework retains its lifecycle owner task and locks. They protect framework state, preserve AnyIO task
 ownership during teardown, serialize identity-changing reconnects, and roll back partially loaded discovery state.
