@@ -105,6 +105,32 @@ def _mock_sdk_client(
     return client
 
 
+def _mock_unnegotiated_session(capabilities: types.ServerCapabilities | None) -> Mock:
+    """Model a caller-owned session that becomes legacy-negotiated on initialize."""
+    initialize_result = (
+        types.InitializeResult(
+            protocol_version="2025-11-25",
+            capabilities=capabilities,
+            server_info=types.Implementation(name="mock-server", version="1.0"),
+        )
+        if capabilities is not None
+        else Mock(protocol_version="2025-11-25", capabilities=None)
+    )
+    session = Mock(spec=ClientSession)
+    session.protocol_version = None
+    session.server_capabilities = None
+    session.initialize_result = None
+
+    async def initialize() -> Any:
+        session.protocol_version = "2025-11-25"
+        session.server_capabilities = capabilities
+        session.initialize_result = initialize_result
+        return initialize_result
+
+    session.initialize = AsyncMock(side_effect=initialize)
+    return session
+
+
 class _TransportBoundClientContext:
     """Model SDK-owned transport entry and exit without running a protocol dispatcher."""
 
@@ -5817,7 +5843,6 @@ async def test_mcp_tool_connection_properly_invalidated_after_closed_resource_er
 
     # Mock the session
     mock_session = MagicMock()
-    mock_session._request_id = 1
     mock_session.call_tool = AsyncMock()
 
     # Mock _exit_stack.aclose to track cleanup calls
@@ -5916,7 +5941,6 @@ async def test_mcp_tool_get_prompt_reconnection_on_closed_resource_error():
 
     # Mock the session
     mock_session = MagicMock()
-    mock_session._request_id = 1
     mock_session.get_prompt = AsyncMock()
 
     # Mock _exit_stack.aclose to track cleanup calls
@@ -6468,12 +6492,95 @@ async def test_connect_handles_set_logging_level_exception():
             assert "Failed to set log level" in call_args[0][0]
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_version"),
+    [
+        ("auto", "2026-07-28"),
+        ("legacy", "2025-11-25"),
+    ],
+)
+async def test_mcp_tool_reuses_supplied_session(mode: str, expected_version: str) -> None:
+    from mcp import Client
+    from mcp.server import Server, ServerRequestContext
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(
+            result_type="complete",
+            tools=[
+                types.Tool(
+                    name="greet",
+                    input_schema={"type": "object", "properties": {}},
+                )
+            ],
+        )
+
+    async def call_tool(
+        _ctx: ServerRequestContext[Any],
+        params: types.CallToolRequestParams,
+    ) -> types.CallToolResult:
+        assert params.name == "greet"
+        return types.CallToolResult(
+            result_type="complete",
+            content=[types.TextContent(type="text", text="Hello!")],
+            is_error=False,
+        )
+
+    server = Server(
+        "test-server",
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+    )
+
+    async with Client(server, mode=mode) as client:
+        session = client.session
+        assert session.protocol_version == expected_version
+
+        initialize = AsyncMock(wraps=session.initialize)
+        discover = AsyncMock(wraps=session.discover)
+        send_ping = AsyncMock(wraps=session.send_ping)
+
+        with (
+            patch.object(session, "initialize", initialize),
+            patch.object(session, "discover", discover),
+            patch.object(session, "send_ping", send_ping),
+        ):
+            wrapper = MCPStdioTool(
+                name="test",
+                command="unused",
+                session=session,
+                load_prompts=False,
+            )
+
+            async with wrapper:
+                assert wrapper.session is session
+                assert [function.name for function in wrapper.functions] == ["greet"]
+                assert _mcp_result_to_text(await wrapper.call_tool("greet")) == "Hello!"
+
+            initialize.assert_not_awaited()
+            discover.assert_not_awaited()
+            if mode == "auto":
+                send_ping.assert_not_awaited()
+
+        # The wrapper has closed, but the caller-owned session must still work.
+        result = await session.call_tool("greet")
+        assert isinstance(result.content[0], types.TextContent)
+        assert result.content[0].text == "Hello!"
+
+
 async def test_connect_reinitializes_existing_session_and_loads_tools_and_prompts() -> None:
-    tool = MCPTool(name="test_tool", load_tools=True, load_prompts=True)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
+    session = _mock_unnegotiated_session(
+        types.ServerCapabilities(tools=types.ToolsCapability(), prompts=types.PromptsCapability())
+    )
+    tool = MCPTool(  # type: ignore[abstract]  # ty: ignore[call-non-callable]
+        name="test_tool",
+        load_tools=True,
+        load_prompts=True,
+        session=session,
+    )
     tool.is_connected = True
-    tool.session = Mock()
-    tool.session._request_id = 0
-    tool.session.initialize = AsyncMock()
 
     with (
         patch.object(tool, "load_tools", AsyncMock()) as mock_load_tools,
@@ -6482,7 +6589,7 @@ async def test_connect_reinitializes_existing_session_and_loads_tools_and_prompt
     ):
         await tool._connect_on_owner()
 
-    tool.session.initialize.assert_awaited_once()
+    session.initialize.assert_awaited_once()
     mock_load_tools.assert_awaited_once()
     mock_load_prompts.assert_awaited_once()
     assert tool._tools_loaded is True
@@ -6490,28 +6597,25 @@ async def test_connect_reinitializes_existing_session_and_loads_tools_and_prompt
 
 
 async def test_connect_skips_tools_and_prompts_when_server_does_not_advertise_capabilities() -> None:
-    tool = MCPTool(name="test_tool", load_tools=True, load_prompts=True)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.is_connected = True
-    tool.session = Mock()
-    tool.session._request_id = 0
-    tool.session.initialize = AsyncMock(
-        return_value=types.InitializeResult(
-            protocol_version=types.LATEST_PROTOCOL_VERSION,
-            capabilities=types.ServerCapabilities(),
-            server_info=types.Implementation(name="test", version="1.0"),
-        )
+    session = _mock_unnegotiated_session(types.ServerCapabilities())
+    session.list_tools = AsyncMock()
+    session.list_prompts = AsyncMock()
+    session.set_logging_level = AsyncMock()
+    tool = MCPTool(  # type: ignore[abstract]  # ty: ignore[call-non-callable]
+        name="test_tool",
+        load_tools=True,
+        load_prompts=True,
+        session=session,
     )
-    tool.session.list_tools = AsyncMock()
-    tool.session.list_prompts = AsyncMock()
-    tool.session.set_logging_level = AsyncMock()
+    tool.is_connected = True
 
     with patch.object(logger, "level", logging.INFO):
         await tool._connect_on_owner()
 
-    tool.session.initialize.assert_awaited_once()
-    tool.session.list_tools.assert_not_called()
-    tool.session.list_prompts.assert_not_called()
-    tool.session.set_logging_level.assert_not_called()
+    session.initialize.assert_awaited_once()
+    session.list_tools.assert_not_called()
+    session.list_prompts.assert_not_called()
+    session.set_logging_level.assert_not_called()
     assert tool.is_connected is True
     assert tool._supports_tools is False
     assert tool._supports_prompts is False
@@ -6521,42 +6625,42 @@ async def test_connect_skips_tools_and_prompts_when_server_does_not_advertise_ca
 
 
 async def test_connect_treats_missing_capabilities_as_unsupported() -> None:
-    tool = MCPTool(name="test_tool", load_tools=True, load_prompts=True)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
+    session = _mock_unnegotiated_session(None)
+    session.list_tools = AsyncMock()
+    session.list_prompts = AsyncMock()
+    tool = MCPTool(  # type: ignore[abstract]  # ty: ignore[call-non-callable]
+        name="test_tool",
+        load_tools=True,
+        load_prompts=True,
+        session=session,
+    )
     tool.is_connected = True
-    tool.session = Mock()
-    tool.session._request_id = 0
-    tool.session.initialize = AsyncMock(return_value=Mock(capabilities=None))
-    tool.session.list_tools = AsyncMock()
-    tool.session.list_prompts = AsyncMock()
 
     with patch.object(logger, "level", logging.NOTSET):
         await tool._connect_on_owner()
 
-    tool.session.list_tools.assert_not_called()
-    tool.session.list_prompts.assert_not_called()
+    session.list_tools.assert_not_called()
+    session.list_prompts.assert_not_called()
     assert tool._supports_tools is False
     assert tool._supports_prompts is False
     assert tool._supports_logging is False
 
 
 async def test_connect_sets_logging_level_when_server_advertises_logging() -> None:
-    tool = MCPTool(name="test_tool", load_tools=False, load_prompts=False)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.is_connected = True
-    tool.session = Mock()
-    tool.session._request_id = 0
-    tool.session.initialize = AsyncMock(
-        return_value=types.InitializeResult(
-            protocol_version=types.LATEST_PROTOCOL_VERSION,
-            capabilities=types.ServerCapabilities(logging=types.LoggingCapability()),
-            server_info=types.Implementation(name="test", version="1.0"),
-        )
+    session = _mock_unnegotiated_session(types.ServerCapabilities(logging=types.LoggingCapability()))
+    session.set_logging_level = AsyncMock()
+    tool = MCPTool(  # type: ignore[abstract]  # ty: ignore[call-non-callable]
+        name="test_tool",
+        load_tools=False,
+        load_prompts=False,
+        session=session,
     )
-    tool.session.set_logging_level = AsyncMock()
+    tool.is_connected = True
 
     with patch.object(logger, "level", logging.INFO):
         await tool._connect_on_owner()
 
-    tool.session.set_logging_level.assert_awaited_once_with("info")
+    session.set_logging_level.assert_awaited_once_with("info")
     assert tool._supports_logging is True
 
 
