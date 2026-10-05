@@ -8,9 +8,10 @@ import logging
 import os
 import sys
 import warnings
-from contextlib import _AsyncGeneratorContextManager  # type: ignore
+from contextlib import AbstractAsyncContextManager, _AsyncGeneratorContextManager  # type: ignore
 from contextvars import ContextVar
 from datetime import timedelta
+from types import TracebackType
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -72,6 +73,57 @@ def _mcp_result_to_text(result: str | list[Content]) -> str:
         return result
     text = "\n".join(content.text for content in result if content.type == "text" and content.text)
     return text or str(result)
+
+
+def _mock_sdk_client(
+    *,
+    session: Mock | None = None,
+    capabilities: types.ServerCapabilities | None = None,
+    protocol_version: str = "2025-11-25",
+) -> AsyncMock:
+    """Model the SDK client's connected session and negotiated metadata."""
+    capabilities = capabilities if capabilities is not None else types.ServerCapabilities()
+    session = session if session is not None else Mock(spec=ClientSession)
+    session.protocol_version = protocol_version
+    session.server_capabilities = capabilities
+    session.initialize_result = (
+        types.InitializeResult(
+            protocol_version=protocol_version,
+            capabilities=capabilities,
+            server_info=types.Implementation(name="mock-server", version="1.0"),
+        )
+        if protocol_version == "2025-11-25"
+        else None
+    )
+
+    client = AsyncMock()
+    client.session = session
+    client.protocol_version = protocol_version
+    client.server_capabilities = capabilities
+    client.__aenter__.return_value = client
+
+    return client
+
+
+class _TransportBoundClientContext:
+    """Model SDK-owned transport entry and exit without running a protocol dispatcher."""
+
+    def __init__(self, transport: AbstractAsyncContextManager[Any], client: AsyncMock) -> None:
+        self.transport = transport
+        self.client = client
+        self.exit_stack = contextlib.AsyncExitStack()
+
+    async def __aenter__(self) -> AsyncMock:
+        async with contextlib.AsyncExitStack() as stack:
+            await stack.enter_async_context(self.transport)
+            client = await stack.enter_async_context(self.client)
+            self.exit_stack = stack.pop_all()
+        return client
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> bool | None:
+        return await self.exit_stack.__aexit__(exc_type, exc, tb)
 
 
 _HELPER_MCP_TOOL = MCPTool(name="helper")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
@@ -4585,53 +4637,37 @@ async def test_connect_no_sampling_capabilities_without_client():
 
 
 async def test_connect_session_creation_failure():
-    """Test connect() raises ToolException when ClientSession creation fails."""
+    """Test connect() preserves the cause when SDK client construction fails."""
     tool = MCPStdioTool(name="test", command="test-command")
 
-    # Mock successful transport creation
-    mock_transport = (Mock(), Mock())  # (read_stream, write_stream)
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
-
-    # Mock ClientSession to raise an exception
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.side_effect = RuntimeError("Session creation failed")
-
+    with patch("mcp.Client", side_effect=RuntimeError("Client creation failed")):
         with pytest.raises(ToolException) as exc_info:
             await tool.connect()
 
         assert "Failed to create MCP session" in str(exc_info.value)
-        assert "Session creation failed" in str(exc_info.value)  # exception text is now part of the message
-        assert "Session creation failed" in str(exc_info.value.__cause__)
+        assert "Client creation failed" in str(exc_info.value)
+        assert "Client creation failed" in str(exc_info.value.__cause__)
+    await tool.close()
 
 
 async def test_connect_initialization_failure_http_no_command():
-    """Test connect() when session.initialize() fails for HTTP tool (no command attribute)."""
+    """SDK negotiation fails during client entry, before a connected session is available."""
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    failure = ConnectionError("Server not ready")
+    sdk_client.__aenter__.side_effect = failure
 
-    # Mock successful transport creation
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
-
-    # Mock successful session creation but failed initialization
-    mock_session = Mock()
-    mock_session.initialize = AsyncMock(side_effect=ConnectionError("Server not ready"))
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
+    with patch("mcp.Client", return_value=sdk_client):
         with pytest.raises(ToolException) as exc_info:
             await tool.connect()
 
-        # Should use generic error message since HTTP tool doesn't have command
-        assert "MCP server failed to initialize" in str(exc_info.value)
+        assert "Failed to create MCP session" in str(exc_info.value)
         assert "Server not ready" in str(exc_info.value)
+        assert exc_info.value.__cause__ is failure
+        assert tool.session is None
+        assert tool.is_connected is False
+    await tool.close()
 
 
 async def test_connect_cleanup_on_transport_failure():
@@ -4649,6 +4685,7 @@ async def test_connect_cleanup_on_transport_failure():
 
     # Verify cleanup was called
     tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 async def test_connect_cleanup_on_transport_failure_http_uses_generic_message():
@@ -4657,39 +4694,30 @@ async def test_connect_cleanup_on_transport_failure_http_uses_generic_message():
     tool._exit_stack.aclose = AsyncMock()  # type: ignore[method-assign]
     tool.get_mcp_client = Mock(side_effect=RuntimeError("Transport failed"))  # type: ignore[method-assign]
 
-    with pytest.raises(ToolException, match="Failed to connect to MCP server: Transport failed"):
+    with pytest.raises(ToolException, match="Failed to create MCP session: Transport failed"):
         await tool.connect()
 
     tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 async def test_connect_cleanup_on_initialization_failure():
-    """Test that _exit_stack.aclose() is called when initialization fails."""
+    """Test that framework cleanup runs when SDK negotiation fails during entry."""
     tool = MCPStdioTool(name="test", command="test-command")
 
     # Mock _exit_stack.aclose to verify it's called
     tool._exit_stack.aclose = AsyncMock()  # type: ignore[method-assign]
 
-    # Mock successful transport creation
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = RuntimeError("Init failed")
 
-    # Mock successful session creation but failed initialization
-    mock_session = Mock()
-    mock_session.initialize = AsyncMock(side_effect=RuntimeError("Init failed"))
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
+    with patch("mcp.Client", return_value=sdk_client):
         with pytest.raises(ToolException):
             await tool.connect()
 
         # Verify cleanup was called
         tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 async def test_connect_cancelled_error_during_transport_creation_raises_tool_exception():
@@ -4698,10 +4726,11 @@ async def test_connect_cancelled_error_during_transport_creation_raises_tool_exc
     tool._exit_stack.aclose = AsyncMock()  # type: ignore[method-assign]
     tool.get_mcp_client = Mock(side_effect=asyncio.CancelledError("cancel scope"))  # type: ignore[method-assign]
 
-    with pytest.raises(ToolException, match="Failed to connect to MCP server"):
+    with pytest.raises(ToolException, match="Failed to create MCP session"):
         await tool.connect()
 
     tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 async def test_connect_cancelled_error_during_transport_creation_stdio_raises_tool_exception():
@@ -4710,32 +4739,30 @@ async def test_connect_cancelled_error_during_transport_creation_stdio_raises_to
     tool._exit_stack.aclose = AsyncMock()  # type: ignore[method-assign]
     tool.get_mcp_client = Mock(side_effect=asyncio.CancelledError("cancel scope"))  # type: ignore[method-assign]
 
-    with pytest.raises(ToolException, match="Failed to start MCP server 'my-server'"):
+    with pytest.raises(ToolException, match="Failed to create MCP session for server 'my-server'"):
         await tool.connect()
 
     tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 async def test_connect_cancelled_error_during_session_creation_raises_tool_exception():
-    """Test that CancelledError from session creation is wrapped in ToolException."""
+    """Test that an SDK client-entry CancelledError is wrapped in ToolException."""
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("cancel scope")
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(side_effect=asyncio.CancelledError("cancel scope"))
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        with pytest.raises(ToolException, match="Failed to create MCP session"):
-            await tool.connect()
+    with (
+        patch("mcp.Client", return_value=sdk_client),
+        pytest.raises(ToolException, match="Failed to create MCP session"),
+    ):
+        await tool.connect()
+    await tool.close()
 
 
 async def test_connect_cancelled_error_during_initialize_raises_tool_exception():
-    """Test that CancelledError from session.initialize() is wrapped in ToolException.
+    """Test that CancelledError from SDK negotiation is wrapped in ToolException.
 
     This is the primary regression test for the bug: when an MCP server is unreachable,
     the MCP library raises asyncio.CancelledError internally, which previously escaped
@@ -4743,42 +4770,31 @@ async def test_connect_cancelled_error_during_initialize_raises_tool_exception()
     """
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("Cancelled via cancel scope")
 
-    mock_session = Mock()
-    mock_session.initialize = AsyncMock(side_effect=asyncio.CancelledError("Cancelled via cancel scope"))
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        with pytest.raises(ToolException, match="MCP server failed to initialize"):
-            await tool.connect()
+    with (
+        patch("mcp.Client", return_value=sdk_client),
+        pytest.raises(ToolException, match="Failed to create MCP session"),
+    ):
+        await tool.connect()
+    await tool.close()
 
 
 async def test_connect_cancelled_error_during_initialize_stdio_raises_tool_exception():
-    """Test that CancelledError from session.initialize() uses the command-specific message for MCPStdioTool."""
+    """SDK negotiation failures retain the full stdio command in the diagnostic."""
     tool = MCPStdioTool(name="test", command="my-server", args=["--port", "8080"])
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("Cancelled via cancel scope")
 
-    mock_session = Mock()
-    mock_session.initialize = AsyncMock(side_effect=asyncio.CancelledError("Cancelled via cancel scope"))
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        with pytest.raises(ToolException, match="MCP server 'my-server --port 8080' failed to initialize"):
-            await tool.connect()
+    with (
+        patch("mcp.Client", return_value=sdk_client),
+        pytest.raises(ToolException, match="Failed to create MCP session for server 'my-server --port 8080'"),
+    ):
+        await tool.connect()
+    await tool.close()
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="task.cancelling() requires Python >= 3.11")
@@ -4796,65 +4812,55 @@ async def test_connect_genuine_cancellation_during_transport_creation_propagates
             await tool.connect()
 
     tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="task.cancelling() requires Python >= 3.11")
 async def test_connect_genuine_cancellation_during_initialize_propagates():
-    """Test that genuine task cancellation during initialize() propagates as CancelledError."""
+    """Test that genuine task cancellation during SDK negotiation propagates."""
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
     tool._exit_stack.aclose = AsyncMock()  # type: ignore[method-assign]
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
-
-    mock_session = Mock()
-    mock_session.initialize = AsyncMock(side_effect=asyncio.CancelledError("task cancelled"))
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("task cancelled")
 
     mock_cancelled_task = Mock()
     mock_cancelled_task.cancelling.return_value = 1
 
     with (
         patch("asyncio.current_task", return_value=mock_cancelled_task),
-        patch("mcp.client.session.ClientSession") as mock_session_class,
+        patch("mcp.Client", return_value=sdk_client),
+        pytest.raises(asyncio.CancelledError),
     ):
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        with pytest.raises(asyncio.CancelledError):
-            await tool.connect()
+        await tool.connect()
 
     tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="task.cancelling() requires Python >= 3.11")
 async def test_connect_genuine_cancellation_during_session_creation_propagates():
-    """Test that genuine task cancellation during session creation propagates as CancelledError."""
+    """Test that genuine task cancellation during SDK client entry propagates."""
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
     tool._exit_stack.aclose = AsyncMock()  # type: ignore[method-assign]
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("task cancelled")
 
     mock_cancelled_task = Mock()
     mock_cancelled_task.cancelling.return_value = 1
 
     with (
         patch("asyncio.current_task", return_value=mock_cancelled_task),
-        patch("mcp.client.session.ClientSession") as mock_session_class,
+        patch("mcp.Client", return_value=sdk_client),
+        pytest.raises(asyncio.CancelledError),
     ):
-        mock_session_class.return_value.__aenter__ = AsyncMock(side_effect=asyncio.CancelledError("task cancelled"))
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        with pytest.raises(asyncio.CancelledError):
-            await tool.connect()
+        await tool.connect()
 
     tool._exit_stack.aclose.assert_called_once()
+    await tool.close()
 
 
 async def test_aenter_cancelled_error_during_connect_is_catchable_as_exception():
@@ -4865,19 +4871,11 @@ async def test_aenter_cancelled_error_during_connect_is_catchable_as_exception()
     """
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
 
-    mock_session = Mock()
-    mock_session.initialize = AsyncMock(side_effect=asyncio.CancelledError("Cancelled via cancel scope"))
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("Cancelled via cancel scope")
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
+    with patch("mcp.Client", return_value=sdk_client):
         caught = None
         try:
             async with tool:
@@ -4887,6 +4885,7 @@ async def test_aenter_cancelled_error_during_connect_is_catchable_as_exception()
 
         assert caught is not None, "Expected an exception to be caught by except Exception"
         assert isinstance(caught, ToolException)
+    await tool.close()
 
 
 # Tests for _should_propagate_cancelled_error helper
@@ -4918,26 +4917,19 @@ def test_should_propagate_cancelled_error_returns_false_when_task_not_cancelling
 
 
 async def test_connect_cancelled_error_during_session_creation_includes_exception_in_message():
-    """Test that CancelledError from session creation includes exception details in ToolException message."""
+    """Test that an SDK client-entry CancelledError retains its exception details."""
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("cancel scope detail")
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(
-            side_effect=asyncio.CancelledError("cancel scope detail")
-        )
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
+    with patch("mcp.Client", return_value=sdk_client):
         with pytest.raises(ToolException) as exc_info:
             await tool.connect()
 
         assert "Failed to create MCP session" in str(exc_info.value)
         assert "cancel scope detail" in str(exc_info.value)
+    await tool.close()
 
 
 # Tests for _describe_error helper (cancel-scope / exception-group unmasking)
@@ -4975,20 +4967,15 @@ async def test_connect_cancelled_error_unmasks_inner_auth_failure():
     """A 401 swallowed by the MCP client's cancel scope must be named in the ToolException."""
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
 
     real = RuntimeError("401 Client Error: Unauthorized")
     masked = asyncio.CancelledError("Cancelled via cancel scope")
     masked.__context__ = real
 
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(side_effect=masked)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = masked
+    with patch("mcp.Client", return_value=sdk_client):
         with pytest.raises(ToolException) as exc_info:
             await tool.connect()
 
@@ -4996,13 +4983,12 @@ async def test_connect_cancelled_error_unmasks_inner_auth_failure():
         assert "Failed to create MCP session" in message
         assert "401 Client Error: Unauthorized" in message
         assert "Cancelled via cancel scope" not in message
+    await tool.close()
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="ExceptionGroup is Python >= 3.11")
 async def test_connect_bare_cancel_names_cleanup_error_from_exit_stack():
-    """The reported 401 path: initialize() raises a bare CancelledError and the
-    real HTTP failure only surfaces from the exit-stack close. The ToolException
-    must name that close-time error, not the cancellation."""
+    """SDK entry raises a bare cancellation and cleanup reveals the actual HTTP failure."""
     import builtins
 
     exception_group_type = getattr(builtins, "ExceptionGroup", None)
@@ -5011,46 +4997,37 @@ async def test_connect_bare_cancel_names_cleanup_error_from_exit_stack():
 
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
 
     cleanup_group = exception_group_type(
         "unhandled errors in a TaskGroup", [RuntimeError("401 Client Error: Unauthorized")]
     )
 
-    mock_session = Mock()
-    mock_session.initialize = AsyncMock(side_effect=asyncio.CancelledError("Cancelled via cancel scope"))
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("Cancelled via cancel scope")
+    tool._exit_stack.aclose = AsyncMock(side_effect=cleanup_group)  # type: ignore[method-assign]
 
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(side_effect=cleanup_group)
-
+    with patch("mcp.Client", return_value=sdk_client):
         with pytest.raises(ToolException) as exc_info:
             await tool.connect()
 
         message = str(exc_info.value)
-        assert "MCP server failed to initialize" in message
+        assert "Failed to create MCP session" in message
         assert "401 Client Error: Unauthorized" in message
         assert "Cancelled via cancel scope" not in message
+        tool._exit_stack.aclose.assert_awaited_once()
+    tool._exit_stack.aclose.side_effect = None
+    await tool.close()
 
 
 async def test_connect_cancelled_error_during_session_creation_logs_with_exc_info():
-    """Test that CancelledError from session creation is logged with exc_info=True."""
+    """Test that an SDK client-entry cancellation is logged with exc_info=True."""
     tool = MCPStreamableHTTPTool(name="test", url="http://example.com")
+    tool.get_mcp_client = Mock(return_value=Mock())  # type: ignore[method-assign]
+    sdk_client = _mock_sdk_client()
+    sdk_client.__aenter__.side_effect = asyncio.CancelledError("cancel scope")
 
-    mock_transport = (Mock(), Mock())
-    mock_context_manager = Mock()
-    mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-    tool.get_mcp_client = Mock(return_value=mock_context_manager)  # type: ignore[method-assign]
-
-    with patch("mcp.client.session.ClientSession") as mock_session_class:
-        mock_session_class.return_value.__aenter__ = AsyncMock(side_effect=asyncio.CancelledError("cancel scope"))
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
-
+    with patch("mcp.Client", return_value=sdk_client):
         from agent_framework._mcp import logger as mcp_logger
 
         with patch.object(mcp_logger, "debug") as mock_debug:
@@ -5063,6 +5040,7 @@ async def test_connect_cancelled_error_during_session_creation_logs_with_exc_inf
             assert cancel_calls, "Expected a debug log for the cancelled session creation"
             _, kwargs = cancel_calls[0]
             assert kwargs.get("exc_info") is True
+    await tool.close()
 
 
 def test_mcp_stdio_tool_get_mcp_client_with_env_and_kwargs():
@@ -5265,8 +5243,8 @@ async def test_mcp_streamable_http_tool_httpx_client_cleanup():
 
     # Mock the streamable_http_client to avoid actual connections
     with (
-        patch("mcp.client.streamable_http.streamable_http_client") as mock_client,
-        patch("mcp.client.session.ClientSession") as mock_session_class,
+        patch("agent_framework._mcp.streamable_http_client") as mock_client,
+        patch("mcp.Client", side_effect=lambda **_: _mock_sdk_client()),
     ):
         # Setup mock context manager for streamable_http_client
         mock_transport = (Mock(), Mock())
@@ -5274,12 +5252,6 @@ async def test_mcp_streamable_http_tool_httpx_client_cleanup():
         mock_context_manager.__aenter__ = AsyncMock(return_value=mock_transport)
         mock_context_manager.__aexit__ = AsyncMock(return_value=None)
         mock_client.return_value = mock_context_manager
-
-        # Setup mock session
-        mock_session = Mock()
-        mock_session.initialize = AsyncMock()
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock(return_value=None)
 
         tool1 = MCPStreamableHTTPTool(
             name="test",
@@ -6169,17 +6141,11 @@ async def test_mcp_tool_close_cleans_up_in_original_task(caplog):
     )
 
     transport_context = TaskBoundTransportContext()
-    mock_session = Mock()
-    mock_session._request_id = 1
-    mock_session.initialize = AsyncMock()
-
-    mock_session_context = AsyncMock()
-    mock_session_context.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session_context.__aexit__ = AsyncMock(return_value=None)
+    sdk_client = _mock_sdk_client()
 
     with (
         patch.object(tool, "get_mcp_client", return_value=transport_context),
-        patch("mcp.client.session.ClientSession", return_value=mock_session_context),
+        patch("mcp.Client", return_value=_TransportBoundClientContext(transport_context, sdk_client)),
     ):
         await asyncio.create_task(tool.connect())
 
@@ -6189,6 +6155,7 @@ async def test_mcp_tool_close_cleans_up_in_original_task(caplog):
 
     assert transport_context.closed_cleanly is True
     assert transport_context.exit_task is transport_context.enter_task
+    sdk_client.__aexit__.assert_awaited_once()
     assert not any("cancel scope" in record.getMessage().lower() for record in caplog.records)
 
 
@@ -6222,37 +6189,39 @@ async def test_mcp_tool_connect_reset_cleans_up_in_original_task(caplog):
 
     transport_contexts = [TaskBoundTransportContext(), TaskBoundTransportContext()]
     sessions = []
-    session_contexts = []
-    for _ in range(2):
-        session = Mock()
-        session._request_id = 1
-        session.initialize = AsyncMock()
-        session.set_logging_level = AsyncMock()
+    clients = []
+    client_contexts = []
+    for transport_context in transport_contexts:
+        session = Mock(spec=ClientSession)
         sessions.append(session)
-
-        session_context = AsyncMock()
-        session_context.__aenter__ = AsyncMock(return_value=session)
-        session_context.__aexit__ = AsyncMock(return_value=None)
-        session_contexts.append(session_context)
+        client = _mock_sdk_client(session=session)
+        clients.append(client)
+        client_contexts.append(_TransportBoundClientContext(transport_context, client))
 
     with (
         patch.object(tool, "get_mcp_client", side_effect=transport_contexts),
-        patch("mcp.client.session.ClientSession", side_effect=session_contexts),
+        patch("mcp.Client", side_effect=client_contexts),
     ):
-        await tool.connect()
+        try:
+            await tool.connect()
 
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger=logger.name):
-            await asyncio.create_task(tool.connect(reset=True))
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger=logger.name):
+                await asyncio.create_task(tool.connect(reset=True))
 
-        assert transport_contexts[0].closed_cleanly is True
-        assert transport_contexts[0].exit_task is transport_contexts[0].enter_task
-        assert transport_contexts[1].enter_task is transport_contexts[0].enter_task
-        assert tool.session is sessions[1]
-        assert tool.is_connected is True
-        assert not any("cancel scope" in record.getMessage().lower() for record in caplog.records)
+            assert transport_contexts[0].closed_cleanly is True
+            assert transport_contexts[0].exit_task is transport_contexts[0].enter_task
+            assert transport_contexts[1].enter_task is transport_contexts[0].enter_task
+            assert tool.session is sessions[1]
+            assert tool.is_connected is True
+            clients[0].__aexit__.assert_awaited_once()
+            clients[1].__aenter__.assert_awaited_once()
+            assert not any("cancel scope" in record.getMessage().lower() for record in caplog.records)
+        finally:
+            await tool.close()
 
-        await tool.close()
+    assert transport_contexts[1].closed_cleanly is True
+    assert transport_contexts[1].exit_task is transport_contexts[1].enter_task
 
 
 async def test_mcp_tool_connect_from_lifecycle_owner_bypasses_request_lock() -> None:
@@ -6429,30 +6398,18 @@ async def test_connect_sets_logging_level_when_logger_level_is_set():
         load_prompts=False,
     )
 
-    # Mock the transport and session
-    mock_transport = (Mock(), Mock())
-    mock_context = AsyncMock()
-    mock_context.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context.__aexit__ = AsyncMock()
-
-    mock_session = Mock()
-    mock_session._request_id = 1
-    mock_session.initialize = AsyncMock()
+    mock_session = Mock(spec=ClientSession)
     mock_session.set_logging_level = AsyncMock()
-
-    mock_session_context = AsyncMock()
-    mock_session_context.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session_context.__aexit__ = AsyncMock()
+    sdk_client = _mock_sdk_client(
+        session=mock_session, capabilities=types.ServerCapabilities(logging=types.LoggingCapability())
+    )
 
     with (
-        patch.object(tool, "get_mcp_client", return_value=mock_context),
-        patch("mcp.client.session.ClientSession", return_value=mock_session_context),
+        patch("mcp.Client", return_value=sdk_client),
         patch.object(logger, "level", logging.DEBUG),  # Set logger level to DEBUG
     ):
-        await tool.connect()
-
-        # Verify set_logging_level was called with "debug"
-        mock_session.set_logging_level.assert_called_once_with("debug")
+        async with tool:
+            mock_session.set_logging_level.assert_awaited_once_with("debug")
 
 
 async def test_connect_does_not_set_logging_level_when_logger_level_is_notset():
@@ -6466,30 +6423,18 @@ async def test_connect_does_not_set_logging_level_when_logger_level_is_notset():
         load_prompts=False,
     )
 
-    # Mock the transport and session
-    mock_transport = (Mock(), Mock())
-    mock_context = AsyncMock()
-    mock_context.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context.__aexit__ = AsyncMock()
-
-    mock_session = Mock()
-    mock_session._request_id = 1
-    mock_session.initialize = AsyncMock()
+    mock_session = Mock(spec=ClientSession)
     mock_session.set_logging_level = AsyncMock()
-
-    mock_session_context = AsyncMock()
-    mock_session_context.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session_context.__aexit__ = AsyncMock()
+    sdk_client = _mock_sdk_client(
+        session=mock_session, capabilities=types.ServerCapabilities(logging=types.LoggingCapability())
+    )
 
     with (
-        patch.object(tool, "get_mcp_client", return_value=mock_context),
-        patch("mcp.client.session.ClientSession", return_value=mock_session_context),
+        patch("mcp.Client", return_value=sdk_client),
         patch.object(logger, "level", logging.NOTSET),  # Set logger level to NOTSET
     ):
-        await tool.connect()
-
-        # Verify set_logging_level was NOT called
-        mock_session.set_logging_level.assert_not_called()
+        async with tool:
+            mock_session.set_logging_level.assert_not_called()
 
 
 async def test_connect_handles_set_logging_level_exception():
@@ -6503,38 +6448,24 @@ async def test_connect_handles_set_logging_level_exception():
         load_prompts=False,
     )
 
-    # Mock the transport and session
-    mock_transport = (Mock(), Mock())
-    mock_context = AsyncMock()
-    mock_context.__aenter__ = AsyncMock(return_value=mock_transport)
-    mock_context.__aexit__ = AsyncMock()
-
-    mock_session = Mock()
-    mock_session._request_id = 1
-    mock_session.initialize = AsyncMock()
+    mock_session = Mock(spec=ClientSession)
     # Make set_logging_level raise an exception
     mock_session.set_logging_level = AsyncMock(side_effect=RuntimeError("Server doesn't support logging level"))
 
-    mock_session_context = AsyncMock()
-    mock_session_context.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session_context.__aexit__ = AsyncMock()
+    sdk_client = _mock_sdk_client(
+        session=mock_session, capabilities=types.ServerCapabilities(logging=types.LoggingCapability())
+    )
 
     with (
-        patch.object(tool, "get_mcp_client", return_value=mock_context),
-        patch("mcp.client.session.ClientSession", return_value=mock_session_context),
+        patch("mcp.Client", return_value=sdk_client),
         patch.object(logger, "level", logging.INFO),  # Set logger level to INFO
         patch.object(logger, "warning") as mock_warning,
     ):
-        # Should NOT raise - the exception should be caught and logged
-        await tool.connect()
-
-        # Verify set_logging_level was called
-        mock_session.set_logging_level.assert_called_once_with("info")
-
-        # Verify warning was logged
-        mock_warning.assert_called_once()
-        call_args = mock_warning.call_args
-        assert "Failed to set log level" in call_args[0][0]
+        async with tool:
+            mock_session.set_logging_level.assert_awaited_once_with("info")
+            mock_warning.assert_called_once()
+            call_args = mock_warning.call_args
+            assert "Failed to set log level" in call_args[0][0]
 
 
 async def test_connect_reinitializes_existing_session_and_loads_tools_and_prompts() -> None:
