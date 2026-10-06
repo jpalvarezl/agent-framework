@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import warnings
+from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, _AsyncGeneratorContextManager  # type: ignore
 from contextvars import ContextVar
 from datetime import timedelta
@@ -3737,6 +3738,275 @@ async def test_mcp_tool_message_handler_notification():
 
     result = await tool.message_handler(unknown_notification)  # type: ignore[func-returns-value]
     assert result is None
+
+
+async def test_mcp_tool_refreshes_catalogs_from_modern_subscription() -> None:
+    from mcp.client.subscriptions import PromptsListChanged, ToolsListChanged
+    from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
+
+    tools_refreshed = asyncio.Event()
+    prompts_refreshed = asyncio.Event()
+    listen_entered = asyncio.Event()
+    listen_exited = asyncio.Event()
+    tool_load_count = 0
+    prompt_load_count = 0
+
+    async def load_tools() -> None:
+        nonlocal tool_load_count
+        tool_load_count += 1
+        if tool_load_count == 2:
+            tools_refreshed.set()
+
+    async def load_prompts() -> None:
+        nonlocal prompt_load_count
+        prompt_load_count += 1
+        if prompt_load_count == 2:
+            prompts_refreshed.set()
+
+    async def events() -> AsyncIterator[ToolsListChanged | PromptsListChanged]:
+        yield ToolsListChanged()
+        yield PromptsListChanged()
+
+    @contextlib.asynccontextmanager
+    async def listen_context() -> AsyncIterator[AsyncIterator[ToolsListChanged | PromptsListChanged]]:
+        listen_entered.set()
+        try:
+            yield events()
+        finally:
+            listen_exited.set()
+
+    capabilities = types.ServerCapabilities(
+        tools=types.ToolsCapability(list_changed=True),
+        prompts=types.PromptsCapability(list_changed=True),
+    )
+    sdk_client = _mock_sdk_client(capabilities=capabilities, protocol_version="2026-07-28")
+    sdk_client.listen = Mock(return_value=listen_context())
+    tool = MCPStdioTool(name="test_tool", command="unused")
+    tool.load_tools = load_tools  # type: ignore[method-assign]
+    tool.load_prompts = load_prompts  # type: ignore[method-assign]
+
+    with patch("mcp.Client", return_value=sdk_client):
+        async with tool:
+            await asyncio.wait_for(listen_entered.wait(), timeout=1)
+            sdk_client.listen.assert_called_once_with(
+                tools_list_changed=True,
+                prompts_list_changed=True,
+            )
+            await asyncio.wait_for(tools_refreshed.wait(), timeout=1)
+            await asyncio.wait_for(prompts_refreshed.wait(), timeout=1)
+
+            subscription_meta = {SUBSCRIPTION_ID_META_KEY: "listen-1"}
+            await tool.message_handler(
+                types.ToolListChangedNotification(params=types.NotificationParams(_meta=subscription_meta))
+            )
+            await tool.message_handler(
+                types.PromptListChangedNotification(params=types.NotificationParams(_meta=subscription_meta))
+            )
+            await asyncio.sleep(0)
+            assert tool_load_count == 2
+            assert prompt_load_count == 2
+
+    assert listen_exited.is_set()
+
+
+async def test_mcp_tool_reuses_and_closes_modern_catalog_subscription() -> None:
+    from mcp.client.subscriptions import PromptsListChanged, ToolsListChanged
+
+    listen_entered = asyncio.Event()
+    never_set = asyncio.Event()
+    enter_count = 0
+    exit_count = 0
+
+    async def events() -> AsyncIterator[ToolsListChanged | PromptsListChanged]:
+        await never_set.wait()
+        yield ToolsListChanged()
+
+    @contextlib.asynccontextmanager
+    async def listen_context() -> AsyncIterator[AsyncIterator[ToolsListChanged | PromptsListChanged]]:
+        nonlocal enter_count, exit_count
+        enter_count += 1
+        listen_entered.set()
+        try:
+            yield events()
+        finally:
+            exit_count += 1
+
+    capabilities = types.ServerCapabilities(
+        tools=types.ToolsCapability(list_changed=True),
+        prompts=types.PromptsCapability(list_changed=True),
+    )
+    sdk_client = _mock_sdk_client(capabilities=capabilities, protocol_version="2026-07-28")
+    sdk_client.listen = Mock(side_effect=lambda **_: listen_context())
+    tool = MCPStdioTool(name="test_tool", command="unused")
+    tool.load_tools = AsyncMock()  # type: ignore[method-assign]
+    tool.load_prompts = AsyncMock()  # type: ignore[method-assign]
+
+    with patch("mcp.Client", return_value=sdk_client):
+        async with tool:
+            await asyncio.wait_for(listen_entered.wait(), timeout=1)
+            subscription_task = tool._capability_list_subscription_task
+            assert subscription_task is not None
+
+            await tool.connect()
+
+            sdk_client.listen.assert_called_once_with(
+                tools_list_changed=True,
+                prompts_list_changed=True,
+            )
+            assert tool._capability_list_subscription_task is subscription_task
+            assert not subscription_task.done()
+
+    assert subscription_task.done()
+    assert tool._capability_list_subscription_task is None
+    assert enter_count == 1
+    assert exit_count == 1
+
+
+async def test_mcp_tool_replaces_modern_catalog_subscription_on_reset() -> None:
+    from mcp.client.subscriptions import PromptsListChanged, ToolsListChanged
+
+    second_listen_entered = asyncio.Event()
+    never_set = asyncio.Event()
+    enter_count = 0
+    exit_count = 0
+
+    async def events() -> AsyncIterator[ToolsListChanged | PromptsListChanged]:
+        await never_set.wait()
+        yield ToolsListChanged()
+
+    @contextlib.asynccontextmanager
+    async def listen_context() -> AsyncIterator[AsyncIterator[ToolsListChanged | PromptsListChanged]]:
+        nonlocal enter_count, exit_count
+        enter_count += 1
+        if enter_count == 2:
+            second_listen_entered.set()
+        try:
+            yield events()
+        finally:
+            exit_count += 1
+
+    capabilities = types.ServerCapabilities(
+        tools=types.ToolsCapability(list_changed=True),
+        prompts=types.PromptsCapability(list_changed=True),
+    )
+    sdk_client = _mock_sdk_client(capabilities=capabilities, protocol_version="2026-07-28")
+    sdk_client.listen = Mock(side_effect=lambda **_: listen_context())
+    tool = MCPStdioTool(name="test_tool", command="unused")
+    tool.load_tools = AsyncMock()  # type: ignore[method-assign]
+    tool.load_prompts = AsyncMock()  # type: ignore[method-assign]
+
+    with patch("mcp.Client", return_value=sdk_client):
+        async with tool:
+            first_task = tool._capability_list_subscription_task
+            assert first_task is not None
+
+            await tool.connect(reset=True)
+            await asyncio.wait_for(second_listen_entered.wait(), timeout=1)
+
+            second_task = tool._capability_list_subscription_task
+            assert second_task is not None
+            assert second_task is not first_task
+            assert first_task.done()
+            assert enter_count == 2
+            assert exit_count == 1
+
+    assert second_task.done()
+    assert tool._capability_list_subscription_task is None
+    assert exit_count == 2
+
+
+async def test_mcp_tool_uses_legacy_catalog_notifications_when_subscription_is_unsupported() -> None:
+    from mcp.client.subscriptions import ListenNotSupportedError
+
+    listen_attempted = asyncio.Event()
+    tools_refreshed = asyncio.Event()
+    prompts_refreshed = asyncio.Event()
+    tool_load_count = 0
+    prompt_load_count = 0
+
+    async def load_tools() -> None:
+        nonlocal tool_load_count
+        tool_load_count += 1
+        if tool_load_count == 2:
+            tools_refreshed.set()
+
+    async def load_prompts() -> None:
+        nonlocal prompt_load_count
+        prompt_load_count += 1
+        if prompt_load_count == 2:
+            prompts_refreshed.set()
+
+    @contextlib.asynccontextmanager
+    async def unsupported_listen() -> AsyncIterator[Any]:
+        listen_attempted.set()
+        raise ListenNotSupportedError("2025-11-25")
+        yield None  # pragma: no cover
+
+    capabilities = types.ServerCapabilities(
+        tools=types.ToolsCapability(list_changed=True),
+        prompts=types.PromptsCapability(list_changed=True),
+    )
+    sdk_client = _mock_sdk_client(capabilities=capabilities)
+    sdk_client.listen = Mock(return_value=unsupported_listen())
+    tool = MCPStdioTool(name="test_tool", command="unused")
+    tool.load_tools = load_tools  # type: ignore[method-assign]
+    tool.load_prompts = load_prompts  # type: ignore[method-assign]
+
+    with patch("mcp.Client", return_value=sdk_client):
+        async with tool:
+            await asyncio.wait_for(listen_attempted.wait(), timeout=1)
+            await tool.message_handler(types.ToolListChangedNotification())
+            await tool.message_handler(types.PromptListChangedNotification())
+            await asyncio.wait_for(tools_refreshed.wait(), timeout=1)
+            await asyncio.wait_for(prompts_refreshed.wait(), timeout=1)
+
+    assert tool_load_count == 2
+    assert prompt_load_count == 2
+
+
+async def test_mcp_tool_cleans_up_when_catalog_subscription_setup_fails() -> None:
+    @contextlib.asynccontextmanager
+    async def rejected_listen() -> AsyncIterator[Any]:
+        raise RuntimeError("subscription rejected")
+        yield None  # pragma: no cover
+
+    capabilities = types.ServerCapabilities(tools=types.ToolsCapability(list_changed=True))
+    sdk_client = _mock_sdk_client(capabilities=capabilities, protocol_version="2026-07-28")
+    sdk_client.listen = Mock(return_value=rejected_listen())
+    tool = MCPStdioTool(name="test_tool", command="unused", load_prompts=False)
+
+    with (
+        patch("mcp.Client", return_value=sdk_client),
+        pytest.raises(RuntimeError, match="subscription rejected"),
+    ):
+        await tool._connect_on_owner()
+
+    sdk_client.__aexit__.assert_awaited_once()
+    assert tool.session is None
+    assert tool.is_connected is False
+
+
+async def test_mcp_tool_closes_subscription_before_reload_tasks_and_exit_stack() -> None:
+    tool = MCPStdioTool(name="test_tool", command="unused")
+    cleanup_order: list[str] = []
+
+    async def cancel_subscription() -> None:
+        cleanup_order.append("subscription")
+
+    async def cancel_reloads() -> None:
+        cleanup_order.append("reloads")
+
+    async def close_stack() -> None:
+        cleanup_order.append("exit_stack")
+
+    with (
+        patch.object(tool, "_cancel_capability_list_subscription", side_effect=cancel_subscription),
+        patch.object(tool, "_cancel_pending_reload_tasks", side_effect=cancel_reloads),
+        patch.object(tool, "_safe_close_exit_stack", side_effect=close_stack),
+    ):
+        await tool._close_on_owner()
+
+    assert cleanup_order == ["subscription", "reloads", "exit_stack"]
 
 
 async def test_mcp_tool_message_handler_error():
