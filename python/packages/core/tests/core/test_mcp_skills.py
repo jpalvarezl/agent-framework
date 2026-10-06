@@ -10,7 +10,7 @@ import io
 import json
 import warnings
 import zipfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 from urllib.parse import unquote
@@ -18,6 +18,7 @@ from urllib.parse import unquote
 import pytest
 from mcp import MCPError
 from mcp.types import (
+    INVALID_PARAMS,
     BlobResourceContents,
     ReadResourceResult,
     TextResourceContents,
@@ -80,13 +81,28 @@ def _make_empty_result() -> ReadResourceResult:
     return ReadResourceResult(contents=[])
 
 
-def _make_client(**read_resource_responses: ReadResourceResult) -> AsyncMock:
+def _legacy_resource_not_found(uri: str) -> MCPError:
+    return MCPError(-32002, f"Resource not found: {uri}")
+
+
+def _modern_resource_not_found(uri: str) -> MCPError:
+    return MCPError(INVALID_PARAMS, "Resource not found", {"uri": uri})
+
+
+_RESOURCE_NOT_FOUND_ERRORS = [_legacy_resource_not_found, _modern_resource_not_found]
+
+
+def _make_client(
+    *,
+    resource_not_found_error: Callable[[str], MCPError] = _legacy_resource_not_found,
+    **read_resource_responses: ReadResourceResult,
+) -> AsyncMock:
     """Create a mock ClientSession whose read_resource returns different results per URI.
 
     Args:
+        resource_not_found_error: Creates the missing-resource error for an unknown URI.
         **read_resource_responses: Mapping of URI string to ReadResourceResult.
-            Any URI not in this mapping raises MCPError with the MCP-spec
-            "Resource not found" code (-32002).
+            Any URI not in this mapping raises the configured missing-resource error.
     """
     client = AsyncMock()
 
@@ -94,7 +110,7 @@ def _make_client(**read_resource_responses: ReadResourceResult) -> AsyncMock:
         uri_str = str(uri)
         if uri_str in read_resource_responses:
             return read_resource_responses[uri_str]
-        raise MCPError(-32002, f"Resource not found: {uri_str}")
+        raise resource_not_found_error(uri_str)
 
     client.read_resource = AsyncMock(side_effect=_read_resource)
     return client
@@ -644,7 +660,15 @@ class TestMCPSkillsSource:
         skills = await source.get_skills(_SOURCE_CTX)
         assert skills == []
 
-    async def test_archive_missing_resource_is_skipped(self) -> None:
+    @pytest.mark.parametrize(
+        "resource_not_found_error",
+        _RESOURCE_NOT_FOUND_ERRORS,
+        ids=["legacy-shape", "modern-shape"],
+    )
+    async def test_archive_missing_resource_is_skipped(
+        self,
+        resource_not_found_error: Callable[[str], MCPError],
+    ) -> None:
         # An archive entry whose archive resource is not available on the server
         # is skipped (the index is read, but the archive download fails).
         index_json = json.dumps({
@@ -658,7 +682,10 @@ class TestMCPSkillsSource:
                 }
             ],
         })
-        client = _make_client(**{"skill://index.json": _make_text_result(index_json, uri="skill://index.json")})
+        client = _make_client(
+            resource_not_found_error=resource_not_found_error,
+            **{"skill://index.json": _make_text_result(index_json, uri="skill://index.json")},
+        )
         source = MCPSkillsSource(client=client)
         skills = await source.get_skills(_SOURCE_CTX)
         assert skills == []
@@ -757,10 +784,9 @@ class TestMCPSkillsSource:
 class TestMCPSkillsSourceErrorCodeBranching:
     """Tests that MCPSkillsSource and MCPSkill branch on MCPError.error.code.
 
-    Only "not found" codes (RESOURCE_NOT_FOUND -32002, METHOD_NOT_FOUND -32601)
-    should be silently swallowed as "no skills available." Other MCPError codes
-    and non-MCPError exceptions must propagate so that auth failures, server
-    crashes, and connection drops are visible.
+    The legacy -32002 code, METHOD_NOT_FOUND, and INVALID_PARAMS carrying the
+    exact requested URI mean the resource is absent. Other MCPError shapes and
+    non-MCPError exceptions must propagate so failures remain visible.
     """
 
     async def test_index_method_not_found_returns_empty(self) -> None:
@@ -771,18 +797,36 @@ class TestMCPSkillsSourceErrorCodeBranching:
         skills = await source.get_skills(_SOURCE_CTX)
         assert skills == []
 
-    async def test_index_resource_not_found_returns_empty(self) -> None:
-        """MCP-spec "Resource not found" (-32002) -> server has no index."""
-        client = AsyncMock()
-        client.read_resource = AsyncMock(side_effect=MCPError(-32002, "Resource not found"))
+    @pytest.mark.parametrize(
+        "resource_not_found_error",
+        _RESOURCE_NOT_FOUND_ERRORS,
+        ids=["legacy-shape", "modern-shape"],
+    )
+    async def test_index_resource_not_found_returns_empty(
+        self,
+        resource_not_found_error: Callable[[str], MCPError],
+    ) -> None:
+        """Either valid missing-resource error shape means the server has no skill index."""
+        client = _make_client(resource_not_found_error=resource_not_found_error)
         source = MCPSkillsSource(client=client)
         skills = await source.get_skills(_SOURCE_CTX)
         assert skills == []
 
-    async def test_index_invalid_params_propagates(self) -> None:
-        """INVALID_PARAMS (-32602) is a real bug, must propagate (not "not found")."""
+    @pytest.mark.parametrize(
+        "data",
+        [
+            None,
+            {"uri": "skill://index.json", "reason": "malformed request"},
+        ],
+        ids=["no-uri", "extra-error-data"],
+    )
+    async def test_index_invalid_params_propagates(
+        self,
+        data: dict[str, str] | None,
+    ) -> None:
+        """INVALID_PARAMS propagates unless its data identifies the requested URI."""
         client = AsyncMock()
-        client.read_resource = AsyncMock(side_effect=MCPError(-32602, "Invalid params"))
+        client.read_resource = AsyncMock(side_effect=MCPError(INVALID_PARAMS, "Invalid params", data))
         source = MCPSkillsSource(client=client)
         with pytest.raises(MCPError):
             await source.get_skills(_SOURCE_CTX)
@@ -830,12 +874,19 @@ class TestMCPSkillsSourceErrorCodeBranching:
         with pytest.raises(MCPError):
             await skill.get_resource("references/file.md")
 
-    async def test_get_resource_not_found_returns_none(self) -> None:
-        """MCPError with RESOURCE_NOT_FOUND (-32002) on get_resource returns None."""
+    @pytest.mark.parametrize(
+        "resource_not_found_error",
+        _RESOURCE_NOT_FOUND_ERRORS,
+        ids=["legacy-shape", "modern-shape"],
+    )
+    async def test_get_resource_not_found_returns_none(
+        self,
+        resource_not_found_error: Callable[[str], MCPError],
+    ) -> None:
+        """Either valid missing-resource error shape on get_resource returns None."""
         from agent_framework import SkillFrontmatter
 
-        client = AsyncMock()
-        client.read_resource = AsyncMock(side_effect=MCPError(-32002, "Resource not found"))
+        client = _make_client(resource_not_found_error=resource_not_found_error)
         fm = SkillFrontmatter(name="test-skill", description="Test.")
         skill = MCPSkill(frontmatter=fm, skill_md_uri="skill://test/SKILL.md", client=client)
         result = await skill.get_resource("references/file.md")

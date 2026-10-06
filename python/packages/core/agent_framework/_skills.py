@@ -4450,6 +4450,7 @@ def _is_mcp_resource_not_found(ex: Exception) -> bool:
     * ``METHOD_NOT_FOUND`` (``-32601``) — the server does not implement
       ``resources/read`` at all, which for the skills source is functionally
       equivalent to "no skills available."
+    * ``INVALID_PARAMS`` from an :class:`MCPError` indicating that the ``uri`` parameter is invalid.
 
     All other codes — ``INVALID_PARAMS``, ``INTERNAL_ERROR``, ``PARSE_ERROR``,
     ``CONNECTION_CLOSED``, auth rejections, and generic handler errors
@@ -4457,13 +4458,20 @@ def _is_mcp_resource_not_found(ex: Exception) -> bool:
     token or crashing server is not silently mistaken for "the server has no
     skills."
     """
-    from mcp.shared.exceptions import MCPError as _McpError
-
-    if not isinstance(ex, _McpError):
-        return False
+    from mcp.shared.exceptions import MCPError as _MCPError
+    from mcp.types import INVALID_PARAMS as _INVALID_PARAMS
     from mcp.types import METHOD_NOT_FOUND as _METHOD_NOT_FOUND
 
-    return ex.error.code in {-32002, _METHOD_NOT_FOUND}
+    if not isinstance(ex, _MCPError):
+        return False
+
+    data = ex.error.data
+    return ex.error.code in {-32002, _METHOD_NOT_FOUND} or (
+        ex.error.code == _INVALID_PARAMS
+        and isinstance(data, dict)
+        and cast(dict[str, object], data).keys() == {"uri"}
+        and isinstance(data["uri"], str)
+    )
 
 
 def _mcp_join_text(result: ReadResourceResult) -> str:
