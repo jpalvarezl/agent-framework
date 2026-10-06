@@ -203,7 +203,12 @@ The vector store API is experimental under the shared `VECTOR_STORES` feature ID
 
 ### Model Context Protocol (`_mcp.py`)
 
-- **`MCPTool`** - Base wrapper that owns the MCP `ClientSession` and exposes the remote server's tools as `FunctionTool`s.
+- **Client lifecycle design** - [ADR 0045](../../../docs/decisions/0045-python-mcp-v2-client-lifecycle.md) is the
+  current evidence-backed target for high-level `mcp.Client` versus low-level `ClientSession` ownership during the
+  Python MCP v2 migration; not every target-state item is implemented yet. Keep the ADR aligned when implementation
+  evidence changes this boundary.
+- **`MCPTool`** - Base wrapper that currently exposes the MCP `ClientSession` and the remote server's tools as
+  `FunctionTool`s. Follow ADR 0045 when migrating standard operations to the retained high-level client.
 - **`MCPStdioTool`** / **`MCPStreamableHTTPTool`** - Supported transport-specific subclasses.
   **`MCPWebsocketTool`** remains only as a deprecated compatibility symbol because MCP v2 removed WebSocket
   transport; it cannot create a connection.
