@@ -604,6 +604,41 @@ class TestMCPSkillsSource:
             call("skill://unit-converter/SKILL.md", cache_mode="bypass"),
         ]
 
+    async def test_high_level_client_drives_state_only_mrtr_for_skill_resource(self) -> None:
+        from mcp import Client
+        from mcp.server import Server, ServerRequestContext
+        from mcp.types import InputRequiredResult, ReadResourceRequestParams
+
+        calls: list[tuple[int | str | None, str, str | None]] = []
+
+        async def read_resource(
+            ctx: ServerRequestContext[Any],
+            params: ReadResourceRequestParams,
+        ) -> ReadResourceResult | InputRequiredResult:
+            uri = str(params.uri)
+            if uri == "skill://index.json":
+                return _make_text_result(SAMPLE_SKILL_INDEX, uri=uri)
+            calls.append((ctx.request_id, uri, params.request_state))
+            if params.request_state is None:
+                return InputRequiredResult(request_state="opaque-resource-state")
+            return _make_text_result(SAMPLE_SKILL_MD, uri=uri)
+
+        server = Server("mrtr-skills-server", on_read_resource=read_resource)
+
+        async with Client(server) as client:
+            source = MCPSkillsSource(client=client)
+            skill = (await source.get_skills(_SOURCE_CTX))[0]
+            content = await skill.get_content()
+
+        assert content == SAMPLE_SKILL_MD
+        assert [(uri, state) for _, uri, state in calls] == [
+            ("skill://unit-converter/SKILL.md", None),
+            ("skill://unit-converter/SKILL.md", "opaque-resource-state"),
+        ]
+        assert calls[0][0] is not None
+        assert calls[1][0] is not None
+        assert calls[0][0] != calls[1][0]
+
     @pytest.mark.parametrize(
         "uri",
         [

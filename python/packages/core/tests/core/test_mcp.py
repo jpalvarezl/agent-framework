@@ -4914,17 +4914,17 @@ async def test_mcp_tool_sampling_callback_always_passes_max_tokens():
 
 
 async def test_connect_sampling_capabilities_with_client():
-    """Test connect() uses legacy mode and advertises sampling when a chat client is configured."""
+    """Test connect() uses the SDK's auto mode and advertises sampling when a chat client is configured."""
     tool = MCPStdioTool(name="test", command="test-command", load_tools=False, load_prompts=False)
     tool.client = Mock()
 
     with patch("mcp.Client") as mock_client_class:
-        sdk_client = _mock_sdk_client()
+        sdk_client = _mock_sdk_client(protocol_version="2026-07-28")
         mock_client_class.return_value = sdk_client
 
         async with tool:
             call_kwargs = mock_client_class.call_args.kwargs
-            assert call_kwargs["mode"] == "legacy"
+            assert "mode" not in call_kwargs
             sampling_caps = call_kwargs.get("sampling_capabilities")
             assert sampling_caps is not None
             assert isinstance(sampling_caps, types.SamplingCapability)
@@ -4933,7 +4933,7 @@ async def test_connect_sampling_capabilities_with_client():
 
 
 async def test_connect_no_sampling_capabilities_without_client():
-    """Test connect() keeps auto mode and omits sampling capabilities without a chat client."""
+    """Test connect() uses the SDK's auto mode and omits sampling capabilities without a chat client."""
     tool = MCPStdioTool(name="test", command="test-command", load_tools=False, load_prompts=False)
 
     with patch("mcp.Client") as mock_client_class:
@@ -4943,7 +4943,7 @@ async def test_connect_no_sampling_capabilities_without_client():
         try:
             await tool.connect()
             call_kwargs = mock_client_class.call_args.kwargs
-            assert call_kwargs["mode"] == "auto"
+            assert "mode" not in call_kwargs
             assert call_kwargs.get("sampling_capabilities") is None
         finally:
             await tool.close()
@@ -6921,6 +6921,361 @@ async def test_connect_handles_set_logging_level_exception():
             mock_warning.assert_called_once()
             call_args = mock_warning.call_args
             assert "Failed to set log level" in call_args[0][0]
+
+
+def _mcp_tool_for_in_process_server(
+    server: Any,
+    *,
+    load_tools: bool,
+    load_prompts: bool,
+    client: SupportsChatGetResponse | None = None,
+    sampling_approval_callback: Callable[[types.CreateMessageRequestParams], bool] | None = None,
+) -> MCPTool:
+    class _InProcessMCPTool(MCPTool):
+        def get_mcp_client(self) -> Any:
+            return server
+
+    return _InProcessMCPTool(
+        name="mrtr-test",
+        load_tools=load_tools,
+        load_prompts=load_prompts,
+        client=client,
+        sampling_approval_callback=sampling_approval_callback,
+    )
+
+
+async def test_tool_call_drives_state_only_mrtr_through_high_level_client() -> None:
+    from mcp.server import Server, ServerRequestContext
+
+    calls: list[tuple[int | str | None, str, dict[str, Any] | None, str | None]] = []
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(
+            tools=[
+                types.Tool(
+                    name="greet",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"],
+                    },
+                )
+            ]
+        )
+
+    async def call_tool(
+        ctx: ServerRequestContext[Any],
+        params: types.CallToolRequestParams,
+    ) -> types.CallToolResult | types.InputRequiredResult:
+        arguments = params.arguments
+        assert arguments is not None
+        calls.append((ctx.request_id, params.name, arguments, params.request_state))
+        if params.request_state is None:
+            return types.InputRequiredResult(request_state="opaque-tool-state")
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"Hello, {arguments['name']}!")])
+
+    server = Server("mrtr-tool-server", on_list_tools=list_tools, on_call_tool=call_tool)
+    tool = _mcp_tool_for_in_process_server(server, load_tools=True, load_prompts=False)
+
+    async with tool:
+        result = await tool.call_tool("greet", name="Ada")
+
+    assert _mcp_result_to_text(result) == "Hello, Ada!"
+    assert [(name, arguments, state) for _, name, arguments, state in calls] == [
+        ("greet", {"name": "Ada"}, None),
+        ("greet", {"name": "Ada"}, "opaque-tool-state"),
+    ]
+    assert calls[0][0] is not None
+    assert calls[1][0] is not None
+    assert calls[0][0] != calls[1][0]
+
+
+async def test_tool_call_resolves_sampling_mrtr_input_request_through_existing_approval_surface() -> None:
+    from mcp.server import Server, ServerRequestContext
+
+    calls: list[tuple[int | str | None, dict[str, Any] | None, str | None]] = []
+    approvals: list[types.CreateMessageRequestParams] = []
+    sampling_request = types.CreateMessageRequest(
+        params=types.CreateMessageRequestParams(
+            messages=[
+                types.SamplingMessage(
+                    role="user",
+                    content=types.TextContent(type="text", text="What is the capital of France?"),
+                )
+            ],
+            max_tokens=32,
+        )
+    )
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(
+            tools=[types.Tool(name="answer", input_schema={"type": "object", "properties": {}})]
+        )
+
+    async def call_tool(
+        ctx: ServerRequestContext[Any],
+        params: types.CallToolRequestParams,
+    ) -> types.CallToolResult | types.InputRequiredResult:
+        calls.append((ctx.request_id, params.input_responses, params.request_state))
+        if params.input_responses is None:
+            return types.InputRequiredResult(
+                input_requests={"sample": sampling_request},
+                request_state="opaque-sampling-state",
+            )
+        sample = params.input_responses["sample"]
+        assert isinstance(sample, types.CreateMessageResult)
+        assert isinstance(sample.content, types.TextContent)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=sample.content.text)])
+
+    def approve(params: types.CreateMessageRequestParams) -> bool:
+        approvals.append(params)
+        return True
+
+    chat_client = AsyncMock()
+    chat_client.get_response = AsyncMock(return_value=_make_sampling_response("Paris"))
+    server = Server("mrtr-sampling-server", on_list_tools=list_tools, on_call_tool=call_tool)
+    with pytest.warns(DeprecationWarning, match="MCP sampling"):
+        tool = _mcp_tool_for_in_process_server(
+            server,
+            load_tools=True,
+            load_prompts=False,
+            client=chat_client,
+            sampling_approval_callback=approve,
+        )
+
+    async with tool:
+        result = await tool.call_tool("answer")
+
+    assert _mcp_result_to_text(result) == "Paris"
+    assert approvals == [sampling_request.params]
+    assert [state for _, _, state in calls] == [None, "opaque-sampling-state"]
+    assert calls[0][0] is not None
+    assert calls[1][0] is not None
+    assert calls[0][0] != calls[1][0]
+
+
+async def test_auto_mode_falls_back_to_legacy_sampling_backchannel() -> None:
+    from contextlib import asynccontextmanager
+
+    import anyio
+    from mcp.shared.memory import create_client_server_memory_streams
+    from mcp.shared.message import SessionMessage
+
+    sampling_params = types.CreateMessageRequestParams(
+        messages=[
+            types.SamplingMessage(
+                role="user",
+                content=types.TextContent(type="text", text="What is the capital of France?"),
+            )
+        ],
+        max_tokens=32,
+    )
+    discover_calls = 0
+    initialize_capabilities: dict[str, Any] | None = None
+    approvals: list[types.CreateMessageRequestParams] = []
+
+    @asynccontextmanager
+    async def legacy_transport() -> AsyncIterator[tuple[Any, Any]]:
+        async with create_client_server_memory_streams() as (client_streams, server_streams):
+            client_read, client_write = client_streams
+            server_read, server_write = server_streams
+
+            async def run_server() -> None:
+                nonlocal discover_calls, initialize_capabilities
+                async for session_message in server_read:
+                    if isinstance(session_message, Exception):
+                        raise session_message
+                    message = session_message.message
+                    if isinstance(message, types.JSONRPCNotification):
+                        continue
+                    assert isinstance(message, types.JSONRPCRequest)
+
+                    if message.method == "server/discover":
+                        discover_calls += 1
+                        response: types.JSONRPCResponse | types.JSONRPCError = types.JSONRPCError(
+                            jsonrpc="2.0",
+                            id=message.id,
+                            error=types.ErrorData(code=types.METHOD_NOT_FOUND, message="Method not found"),
+                        )
+                    elif message.method == "initialize":
+                        assert message.params is not None
+                        initialize_capabilities = message.params["capabilities"]
+                        response = types.JSONRPCResponse(
+                            jsonrpc="2.0",
+                            id=message.id,
+                            result={
+                                "protocolVersion": "2025-11-25",
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "legacy-sampling-server", "version": "1.0"},
+                            },
+                        )
+                    elif message.method == "ping":
+                        response = types.JSONRPCResponse(jsonrpc="2.0", id=message.id, result={})
+                    elif message.method == "tools/list":
+                        response = types.JSONRPCResponse(
+                            jsonrpc="2.0",
+                            id=message.id,
+                            result={"tools": [{"name": "answer", "inputSchema": {"type": "object", "properties": {}}}]},
+                        )
+                    elif message.method == "tools/call":
+                        await server_write.send(
+                            SessionMessage(
+                                types.JSONRPCRequest(
+                                    jsonrpc="2.0",
+                                    id="sampling-1",
+                                    method="sampling/createMessage",
+                                    params=sampling_params.model_dump(by_alias=True, mode="json", exclude_none=True),
+                                )
+                            )
+                        )
+                        sample_message = await server_read.receive()
+                        assert not isinstance(sample_message, Exception)
+                        sample_response = sample_message.message
+                        assert isinstance(sample_response, types.JSONRPCResponse)
+                        assert sample_response.id == "sampling-1"
+                        sample_content = sample_response.result["content"]
+                        assert isinstance(sample_content, dict)
+                        response = types.JSONRPCResponse(
+                            jsonrpc="2.0",
+                            id=message.id,
+                            result={
+                                "content": [{"type": "text", "text": sample_content["text"]}],
+                                "isError": False,
+                            },
+                        )
+                    else:
+                        raise AssertionError(f"Unexpected legacy MCP method: {message.method}")
+                    await server_write.send(SessionMessage(response))
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(run_server)
+                try:
+                    yield client_read, client_write
+                finally:
+                    await client_write.aclose()
+
+    def approve(params: types.CreateMessageRequestParams) -> bool:
+        approvals.append(params)
+        return True
+
+    chat_client = AsyncMock()
+    chat_client.get_response = AsyncMock(return_value=_make_sampling_response("Paris"))
+    with pytest.warns(DeprecationWarning, match="MCP sampling"):
+        tool = _mcp_tool_for_in_process_server(
+            legacy_transport(),
+            load_tools=True,
+            load_prompts=False,
+            client=chat_client,
+            sampling_approval_callback=approve,
+        )
+
+    async with tool:
+        assert tool.session is not None
+        assert tool.session.protocol_version == "2025-11-25"
+        result = await tool.call_tool("answer")
+
+    assert discover_calls == 1
+    assert initialize_capabilities is not None
+    assert "sampling" in initialize_capabilities
+    assert _mcp_result_to_text(result) == "Paris"
+    assert approvals == [sampling_params]
+    chat_client.get_response.assert_awaited_once()
+
+
+async def test_prompt_get_drives_state_only_mrtr_through_high_level_client() -> None:
+    from mcp.server import Server, ServerRequestContext
+
+    calls: list[tuple[int | str | None, str, dict[str, str] | None, str | None]] = []
+
+    async def list_prompts(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListPromptsResult:
+        return types.ListPromptsResult(
+            prompts=[
+                types.Prompt(
+                    name="briefing",
+                    arguments=[types.PromptArgument(name="topic", required=True)],
+                )
+            ]
+        )
+
+    async def get_prompt(
+        ctx: ServerRequestContext[Any],
+        params: types.GetPromptRequestParams,
+    ) -> types.GetPromptResult | types.InputRequiredResult:
+        arguments = params.arguments
+        assert arguments is not None
+        calls.append((ctx.request_id, params.name, arguments, params.request_state))
+        if params.request_state is None:
+            return types.InputRequiredResult(request_state="opaque-prompt-state")
+        return types.GetPromptResult(
+            messages=[
+                types.PromptMessage(
+                    role="user",
+                    content=types.TextContent(type="text", text=f"Explain {arguments['topic']}"),
+                )
+            ]
+        )
+
+    server = Server("mrtr-prompt-server", on_list_prompts=list_prompts, on_get_prompt=get_prompt)
+    tool = _mcp_tool_for_in_process_server(server, load_tools=False, load_prompts=True)
+
+    async with tool:
+        result = await tool.functions[0].invoke(topic="Python")
+
+    assert _mcp_result_to_text(result) == "Explain Python"
+    assert [(name, arguments, state) for _, name, arguments, state in calls] == [
+        ("briefing", {"topic": "Python"}, None),
+        ("briefing", {"topic": "Python"}, "opaque-prompt-state"),
+    ]
+    assert calls[0][0] is not None
+    assert calls[1][0] is not None
+    assert calls[0][0] != calls[1][0]
+
+
+async def test_supplied_session_does_not_drive_mrtr_automatically() -> None:
+    from mcp import Client
+    from mcp.server import Server, ServerRequestContext
+
+    call_count = 0
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        return types.ListToolsResult(
+            tools=[types.Tool(name="greet", input_schema={"type": "object", "properties": {}})]
+        )
+
+    async def call_tool(
+        _ctx: ServerRequestContext[Any],
+        _params: types.CallToolRequestParams,
+    ) -> types.InputRequiredResult:
+        nonlocal call_count
+        call_count += 1
+        return types.InputRequiredResult(request_state="caller-owned-state")
+
+    server = Server("mrtr-session-server", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    async with Client(server) as client:
+        wrapper = MCPStdioTool(
+            name="mrtr-session",
+            command="unused",
+            session=client.session,
+            load_prompts=False,
+        )
+        async with wrapper:
+            with pytest.raises(ToolExecutionException, match="input_required"):
+                await wrapper.call_tool("greet")
+
+    assert call_count == 1
 
 
 @pytest.mark.parametrize(

@@ -2218,11 +2218,9 @@ class MCPTool:
                     sampling_capabilities = types.SamplingCapability(
                         tools=types.SamplingToolsCapability(),
                     )
-                client_mode = "legacy" if self.client is not None else "auto"
                 mcp_client = await self._exit_stack.enter_async_context(
                     Client(
                         server=self.get_mcp_client(),
-                        mode=client_mode,
                         read_timeout_seconds=(
                             timedelta(seconds=self.request_timeout).seconds if self.request_timeout else None
                         ),
