@@ -207,8 +207,11 @@ The vector store API is experimental under the shared `VECTOR_STORES` feature ID
   current evidence-backed target for high-level `mcp.Client` versus low-level `ClientSession` ownership during the
   Python MCP v2 migration; not every target-state item is implemented yet. Keep the ADR aligned when implementation
   evidence changes this boundary.
-- **`MCPTool`** - Base wrapper that currently exposes the MCP `ClientSession` and the remote server's tools as
-  `FunctionTool`s. Follow ADR 0045 when migrating standard operations to the retained high-level client.
+- **`MCPTool` connection state** - The private `_MCPConnection` Protocol is the normalized tools/prompts/catalog
+  surface. `_ClientMCPConnection` and `_SessionMCPConnection` each own one lifecycle responsibility; `None` means
+  disconnected, and the Client implementation is the single update point for SDK cache policy. `MCPTool.session`
+  remains a compatibility view/setter; constructor or direct assignment of a session selects the caller-owned
+  low-level path.
 - **`MCPStdioTool`** / **`MCPStreamableHTTPTool`** - Supported transport-specific subclasses.
   **`MCPWebsocketTool`** remains only as a deprecated compatibility symbol because MCP v2 removed WebSocket
   transport; it cannot create a connection.
