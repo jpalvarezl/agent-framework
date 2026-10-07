@@ -4192,12 +4192,12 @@ async def test_mcp_tool_sampling_defaults_stay_silent_until_callback_is_used():
         tool = MCPStdioTool(name="test_tool", command="python")
 
     callback = getattr(MCPTool, "sampling_callback")  # noqa: B009
-    assert "2027-07-28" in getattr(callback, "__deprecated__", "")
+    assert "eligible for removal" in getattr(callback, "__deprecated__", "")
 
     params = Mock()
     params.messages = []
 
-    with pytest.warns(DeprecationWarning, match="MCP sampling.*2027-07-28"):
+    with pytest.warns(DeprecationWarning, match="MCP sampling.*eligible for removal"):
         result = await _invoke_sampling_callback(tool, params)
 
     assert isinstance(result, types.ErrorData)
@@ -4205,7 +4205,7 @@ async def test_mcp_tool_sampling_defaults_stay_silent_until_callback_is_used():
 
 async def test_mcp_tool_sampling_configuration_warns_once():
     """Each sampling option warns at setup, without warning again on callback use."""
-    with pytest.warns(DeprecationWarning, match="MCP sampling.*2027-07-28") as warning_info:
+    with pytest.warns(DeprecationWarning, match="MCP sampling.*eligible for removal") as warning_info:
         tool = MCPStdioTool(
             name="test_tool",
             command="python",
@@ -4244,7 +4244,7 @@ async def test_mcp_tool_sampling_configuration_warns_once():
 )
 def test_mcp_tool_each_sampling_option_warns(sampling_option: dict[str, Any]):
     """Each non-default sampling option enables the setup warning."""
-    with pytest.warns(DeprecationWarning, match="MCP sampling.*2027-07-28") as warning_info:
+    with pytest.warns(DeprecationWarning, match="MCP sampling.*eligible for removal") as warning_info:
         MCPStdioTool(name="test_tool", command="python", **sampling_option)
 
     assert len(warning_info) == 1
@@ -6843,7 +6843,7 @@ async def test_mcp_tool_safe_close_handles_cleanup_exception_group():
 
 
 async def test_connect_sets_logging_level_when_logger_level_is_set():
-    """Test that connect() sets the MCP server logging level when the logger level is not NOTSET."""
+    """Test that connect() configures modern metadata and the legacy server logging level."""
 
     tool = MCPStdioTool(
         name="test_server",
@@ -6860,10 +6860,11 @@ async def test_connect_sets_logging_level_when_logger_level_is_set():
     )
 
     with (
-        patch("mcp.Client", return_value=sdk_client),
+        patch("mcp.Client", return_value=sdk_client) as mock_client_class,
         patch.object(logger, "level", logging.DEBUG),  # Set logger level to DEBUG
     ):
         async with tool:
+            assert mock_client_class.call_args.kwargs["log_level"] == "debug"
             mock_session.set_logging_level.assert_awaited_once_with("debug")
 
 
@@ -6885,10 +6886,11 @@ async def test_connect_does_not_set_logging_level_when_logger_level_is_notset():
     )
 
     with (
-        patch("mcp.Client", return_value=sdk_client),
+        patch("mcp.Client", return_value=sdk_client) as mock_client_class,
         patch.object(logger, "level", logging.NOTSET),  # Set logger level to NOTSET
     ):
         async with tool:
+            assert mock_client_class.call_args.kwargs["log_level"] is None
             mock_session.set_logging_level.assert_not_called()
 
 
@@ -6912,15 +6914,40 @@ async def test_connect_handles_set_logging_level_exception():
     )
 
     with (
-        patch("mcp.Client", return_value=sdk_client),
+        patch("mcp.Client", return_value=sdk_client) as mock_client_class,
         patch.object(logger, "level", logging.INFO),  # Set logger level to INFO
         patch.object(logger, "warning") as mock_warning,
     ):
         async with tool:
+            assert mock_client_class.call_args.kwargs["log_level"] == "info"
             mock_session.set_logging_level.assert_awaited_once_with("info")
             mock_warning.assert_called_once()
             call_args = mock_warning.call_args
             assert "Failed to set log level" in call_args[0][0]
+
+
+async def test_connect_does_not_use_legacy_logging_method_for_modern_server() -> None:
+    tool = MCPStdioTool(
+        name="test_server",
+        command="test_command",
+        load_tools=False,
+        load_prompts=False,
+    )
+    mock_session = Mock(spec=ClientSession)
+    mock_session.set_logging_level = AsyncMock()
+    sdk_client = _mock_sdk_client(
+        session=mock_session,
+        capabilities=types.ServerCapabilities(logging=types.LoggingCapability()),
+        protocol_version="2026-07-28",
+    )
+
+    with (
+        patch("mcp.Client", return_value=sdk_client) as mock_client_class,
+        patch.object(logger, "level", logging.WARNING),
+    ):
+        async with tool:
+            assert mock_client_class.call_args.kwargs["log_level"] == "warning"
+            mock_session.set_logging_level.assert_not_awaited()
 
 
 def _mcp_tool_for_in_process_server(
@@ -9039,14 +9066,15 @@ async def test_mcp_streamble_http_tool_connects_to_v2_server() -> None:
         header_provider=lambda _kw: {"Authorization": "Bearer token-a"},
     )
 
-    async with tool_a:
-        assert tool_a.session is not None
-        assert tool_a.session.protocol_version == "2026-07-28"
-        assert [function.name for function in tool_a.functions] == ["greet"]
+    with patch.object(logger, "level", logging.INFO):
+        async with tool_a:
+            assert tool_a.session is not None
+            assert tool_a.session.protocol_version == "2026-07-28"
+            assert [function.name for function in tool_a.functions] == ["greet"]
 
-        result = await tool_a.call_tool("greet")
-        assert isinstance(result, list)
-        assert [item.text for item in result if item.type == "text"] == ["Hello!"]
+            result = await tool_a.call_tool("greet")
+            assert isinstance(result, list)
+            assert [item.text for item in result if item.type == "text"] == ["Hello!"]
 
     captured_methods = [body["method"] for body, _ in captured_requests]
     assert "server/discover" in captured_methods
@@ -9060,15 +9088,18 @@ async def test_mcp_streamble_http_tool_connects_to_v2_server() -> None:
     params = body["params"]
     meta = params["_meta"]
     assert headers["mcp-protocol-version"] == meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert meta["io.modelcontextprotocol/logLevel"] == "info"
     assert headers["mcp-method"] == body["method"] == "tools/call"
     assert headers["mcp-name"] == params["name"] == "greet"
     assert isinstance(meta["io.modelcontextprotocol/clientCapabilities"], dict)
 
 
 async def test_mcp_streamable_http_tool_connects_to_legacy_server() -> None:
+    from mcp import MCPDeprecationWarning
+
     transport, captured_requests = _make_mcp_protocol_server_mock(
         era="legacy",
-        capabilities={"tools": {}},
+        capabilities={"tools": {}, "logging": {}},
         endpoints={
             "tools/list": {
                 "cacheScope": "private",
@@ -9080,6 +9111,7 @@ async def test_mcp_streamable_http_tool_connects_to_legacy_server() -> None:
                 "content": [{"type": "text", "text": "Hello!"}],
                 "isError": False,
             },
+            "logging/setLevel": {},
         },
     )
     user_client = AsyncClient(transport=transport)
@@ -9091,19 +9123,26 @@ async def test_mcp_streamable_http_tool_connects_to_legacy_server() -> None:
         header_provider=lambda _kw: {"Authorization": "Bearer token-a"},
     )
 
-    async with tool_a:
-        assert tool_a.session is not None
-        assert tool_a.session.protocol_version == "2025-11-25"
-        assert [function.name for function in tool_a.functions] == ["greet"]
+    with (
+        patch.object(logger, "level", logging.WARNING),
+        pytest.warns(MCPDeprecationWarning, match="logging capability"),
+    ):
+        async with tool_a:
+            assert tool_a.session is not None
+            assert tool_a.session.protocol_version == "2025-11-25"
+            assert [function.name for function in tool_a.functions] == ["greet"]
 
-        result = await tool_a.call_tool("greet")
-        assert isinstance(result, list)
-        assert [item.text for item in result if item.type == "text"] == ["Hello!"]
+            result = await tool_a.call_tool("greet")
+            assert isinstance(result, list)
+            assert [item.text for item in result if item.type == "text"] == ["Hello!"]
 
     captured_methods = [body["method"] for body, _ in captured_requests]
     assert "server/discover" in captured_methods
     assert "initialize" in captured_methods
     assert "tools/list" in captured_methods
+    logging_requests = [body for body, _ in captured_requests if body["method"] == "logging/setLevel"]
+    assert len(logging_requests) == 1
+    assert logging_requests[0]["params"]["level"] == "warning"
 
 
 @pytest.mark.parametrize(

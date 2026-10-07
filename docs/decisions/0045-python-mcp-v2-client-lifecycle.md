@@ -165,10 +165,10 @@ transport-specific wrappers.
 
 ### Legacy callbacks, logging, and liveness
 
-The existing sampling-enabled path uses `mode="legacy"` because it relies on the legacy server-to-client
-back-channel. Modern 2026-07-28 sampling, elicitation, and roots requests travel inside MRTR instead. Moving the
-existing sampling option to auto mode requires a separate compatibility decision; it is not an incidental part of
-routing standard calls through `Client`.
+Framework-created connections use `mode="auto"` even when sampling is configured. The SDK routes the same
+`sampling_callback` through the legacy server-to-client back-channel after a 2025 fallback and through embedded MRTR
+requests after modern discovery. Agent Framework does not infer the protocol era from the presence of its sampling
+ChatClient.
 
 Modern protocol logging is per-request metadata. Agent Framework should pass the selected log level to `Client` so
 the SDK stamps `io.modelcontextprotocol/logLevel`; `logging/setLevel` is retained only for a negotiated legacy peer.
@@ -185,8 +185,7 @@ scope:
 
 - Hosting/server remains server-side and checked.
 - Tools, Tool refresh, Prompts, and Skills remain checked for their stated dual-era behavior.
-- MRTR, Caching, Logging, Samples/docs, local validation, and live dual-era validation remain separate unchecked
-  work.
+- MRTR, Caching, Logging, Samples/docs, local validation, and live dual-era validation remain separate checklist work.
 - The protocol-independent prompt snapshot bug remains in
   [microsoft/agent-framework#9115](https://github.com/microsoft/agent-framework/issues/9115).
 - Optional subscription stream recovery remains in

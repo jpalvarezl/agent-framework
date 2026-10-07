@@ -655,8 +655,9 @@ def _as_mcp_connection(  # pyright: ignore[reportUnusedFunction]
 _DEFAULT_SAMPLING_MAX_TOKENS = 4096
 _DEFAULT_SAMPLING_MAX_REQUESTS = 25
 _MCP_SAMPLING_DEPRECATION_MESSAGE = (
-    "MCP sampling is deprecated as of MCP specification version 2026-07-28 and will be removed no later than "
-    "2027-07-28. MCP servers should call LLM provider APIs directly."
+    "MCP sampling is deprecated as of MCP specification version 2026-07-28. Under the MCP feature lifecycle, "
+    "it remains supported for at least twelve months before becoming eligible for removal. "
+    "MCP servers should call LLM provider APIs directly."
 )
 
 # A user-supplied gate invoked before each server-initiated sampling request is
@@ -678,6 +679,15 @@ LOG_LEVEL_MAPPING: dict[str, int] = {
     "alert": logging.CRITICAL,
     "emergency": logging.CRITICAL,
 }
+
+
+def _to_mcp_logging_level(level: int) -> types.LoggingLevel | None:
+    """Map a Python logging level to its MCP equivalent."""
+    if level == logging.NOTSET:
+        return None
+    return cast(
+        "types.LoggingLevel | None", next((name for name, value in LOG_LEVEL_MAPPING.items() if value == level), None)
+    )
 
 
 def _get_input_model_from_mcp_prompt(prompt: types.Prompt) -> dict[str, Any]:
@@ -2189,6 +2199,7 @@ class MCPTool:
         Raises:
             ToolException: If connection or session initialization fails.
         """
+        log_level = _to_mcp_logging_level(logger.level)
         if reset:
             await self._cancel_capability_list_subscription()
             if reset_discovery:
@@ -2226,6 +2237,7 @@ class MCPTool:
                         ),
                         message_handler=self.message_handler,
                         logging_callback=self.logging_callback,
+                        log_level=log_level,
                         sampling_capabilities=sampling_capabilities,
                         sampling_callback=self.sampling_callback,  # pyright: ignore[reportDeprecated]
                     )
@@ -2306,14 +2318,13 @@ class MCPTool:
                     await self.load_prompts()
                 self._prompts_loaded = True
 
-            if logger.level != logging.NOTSET and self._supports_logging is not False:
-                try:
-                    level_name = cast(
-                        Any, next(level for level, value in LOG_LEVEL_MAPPING.items() if value == logger.level)
-                    )
-                    await self._require_connection().set_logging_level(level_name)
-                except Exception as exc:
-                    logger.warning("Failed to set log level to %s", logger.level, exc_info=exc)
+            if log_level is not None:
+                connection = self._require_connection()
+                if connection.session.initialize_result is not None and self._supports_logging is not False:
+                    try:
+                        await connection.set_logging_level(log_level)
+                    except Exception as exc:
+                        logger.warning("Failed to set log level to %s", logger.level, exc_info=exc)
         except (Exception, asyncio.CancelledError):
             try:
                 await self._close_on_owner()
