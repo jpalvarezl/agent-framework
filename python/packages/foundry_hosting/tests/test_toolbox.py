@@ -669,6 +669,38 @@ async def test_skills_source_uses_connected_session(monkeypatch: pytest.MonkeyPa
     assert captured_kwargs == {}
 
 
+async def test_skills_source_uses_current_high_level_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    toolbox = FoundryToolbox(
+        _FakeCredential(),  # type: ignore
+        url="https://h/toolboxes/tb/mcp",
+    )
+    sentinel_client = object()
+    sentinel_session = object()
+    current = {"connection": SimpleNamespace(client=sentinel_client, session=sentinel_session)}
+    monkeypatch.setattr(toolbox, "_require_connection", lambda: current["connection"])
+
+    captured: dict[str, Callable[[], object]] = {}
+
+    class _StubSkillsSource:
+        def __init__(self, *, session_provider: Callable[[], object]) -> None:
+            captured["session_provider"] = session_provider
+
+        async def get_skills(self, context: SkillsSourceContext) -> list[str]:
+            return ["skill-a"]
+
+    monkeypatch.setattr("agent_framework_foundry_hosting._toolbox.MCPSkillsSource", _StubSkillsSource)
+
+    result = await _FoundryToolboxSkillsSource(toolbox).get_skills(_source_context())
+
+    assert result == ["skill-a"]
+    provider = captured["session_provider"]
+    assert provider() is sentinel_client
+
+    replacement_client = object()
+    current["connection"] = SimpleNamespace(client=replacement_client, session=object())
+    assert provider() is replacement_client
+
+
 async def test_skills_source_forwards_archive_options(monkeypatch: pytest.MonkeyPatch) -> None:
     toolbox = FoundryToolbox(
         _FakeCredential(),  # type: ignore

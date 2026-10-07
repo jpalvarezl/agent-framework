@@ -95,8 +95,7 @@ from ._telemetry import FeatureIndex, mark_feature_used
 from ._tools import ApprovalMode, FunctionTool
 
 if TYPE_CHECKING:
-    from mcp import Client
-    from mcp.client.session import ClientSession
+    from mcp import Client, ClientSession
     from mcp.types import ReadResourceResult
 
     from ._agents import SupportsAgentRun
@@ -5405,7 +5404,7 @@ class MCPSkillsSource(SkillsSource):
     Examples:
         .. code-block:: python
 
-            from mcp.client.session import ClientSession
+            from mcp import Client, ClientSession
 
             source = MCPSkillsSource(client=session)
             # `context` is normally supplied by SkillsProvider at runtime.

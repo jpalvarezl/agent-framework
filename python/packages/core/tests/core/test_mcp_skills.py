@@ -12,7 +12,8 @@ import warnings
 import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import timedelta
-from unittest.mock import AsyncMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, call, patch
 from urllib.parse import unquote
 
 import pytest
@@ -571,6 +572,37 @@ class TestMCPSkill:
 
 class TestMCPSkillsSource:
     """Tests for MCPSkillsSource."""
+
+    async def test_high_level_client_reads_resources_with_cache_bypass(self) -> None:
+        from mcp import Client
+        from mcp.server import Server, ServerRequestContext
+        from mcp.types import ReadResourceRequestParams
+
+        responses = {
+            "skill://index.json": _make_text_result(SAMPLE_SKILL_INDEX, uri="skill://index.json"),
+            "skill://unit-converter/SKILL.md": _make_text_result(SAMPLE_SKILL_MD),
+        }
+
+        async def read_resource(
+            _ctx: ServerRequestContext[Any],
+            params: ReadResourceRequestParams,
+        ) -> ReadResourceResult:
+            return responses[str(params.uri)]
+
+        server = Server("skills-server", on_read_resource=read_resource)
+
+        async with Client(server) as client:
+            read_resource_mock = AsyncMock(wraps=client.read_resource)
+            with patch.object(client, "read_resource", read_resource_mock):
+                source = MCPSkillsSource(client=client)
+                skill = (await source.get_skills(_SOURCE_CTX))[0]
+                content = await skill.get_content()
+
+        assert content == SAMPLE_SKILL_MD
+        assert read_resource_mock.await_args_list == [
+            call("skill://index.json", cache_mode="bypass"),
+            call("skill://unit-converter/SKILL.md", cache_mode="bypass"),
+        ]
 
     @pytest.mark.parametrize(
         "uri",
