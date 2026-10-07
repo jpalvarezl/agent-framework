@@ -526,6 +526,10 @@ class _MCPConnection(Protocol):
         """Set the legacy logging level through this connection."""
         ...
 
+    async def read_resource(self, uri: str) -> types.ReadResourceResult:
+        """Read a resource through this connection."""
+        ...
+
 
 @dataclass(frozen=True)
 class _ClientMCPConnection:
@@ -579,6 +583,10 @@ class _ClientMCPConnection:
         """Set the legacy logging level through the underlying session."""
         await self.session.set_logging_level(level)  # pyright: ignore[reportDeprecated]
 
+    async def read_resource(self, uri: str) -> types.ReadResourceResult:
+        """Read a resource through the high-level Client."""
+        return await self.client.read_resource(uri, cache_mode="bypass")
+
 
 @dataclass(frozen=True)
 class _SessionMCPConnection:
@@ -621,6 +629,20 @@ class _SessionMCPConnection:
     async def set_logging_level(self, level: Any) -> None:
         """Set the legacy logging level directly through the session."""
         await self.session.set_logging_level(level)  # pyright: ignore[reportDeprecated]
+
+    async def read_resource(self, uri: str) -> types.ReadResourceResult:
+        """Read a resource through this connection."""
+        return await self.session.read_resource(uri)
+
+
+def _as_mcp_connection(  # pyright: ignore[reportUnusedFunction]
+    client: Client | ClientSession,
+) -> _MCPConnection:
+    from mcp import Client as MCPClient
+
+    if isinstance(client, MCPClient):
+        return _ClientMCPConnection(client)
+    return _SessionMCPConnection(client)
 
 
 # Default safety limits applied to server-initiated MCP sampling requests

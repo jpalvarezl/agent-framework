@@ -88,12 +88,14 @@ from yaml.nodes import MappingNode, Node, ScalarNode
 
 from ._feature_stage import ExperimentalFeature, experimental
 from ._filesystem import _is_link_or_reparse_point  # pyright: ignore[reportPrivateUsage]
+from ._mcp import _as_mcp_connection, _MCPConnection  # pyright: ignore[reportPrivateUsage]
 from ._middleware import FunctionInvocationContext
 from ._sessions import ContextProvider
 from ._telemetry import FeatureIndex, mark_feature_used
 from ._tools import ApprovalMode, FunctionTool
 
 if TYPE_CHECKING:
+    from mcp import Client
     from mcp.client.session import ClientSession
     from mcp.types import ReadResourceResult
 
@@ -4589,11 +4591,11 @@ def _parse_mcp_skill_index(text: str) -> _McpSkillIndex:
     return _McpSkillIndex(schema=raw.get("$schema"), skills=entries)
 
 
-def _resolve_mcp_session_provider(
-    client: ClientSession | None,
-    session_provider: Callable[[], ClientSession] | None,
-) -> Callable[[], ClientSession]:
-    """Normalize the two MCP session inputs into a single session resolver.
+def _resolve_mcp_connection_provider(
+    client: Client | ClientSession | None,
+    session_provider: Callable[[], Client | ClientSession] | None,
+) -> Callable[[], _MCPConnection]:
+    """Normalize the two MCP connection inputs into a single session resolver.
 
     Callers supply **exactly one** of a fixed ``client`` or a
     ``session_provider`` callable. A fixed client is wrapped in a provider that
@@ -4602,24 +4604,26 @@ def _resolve_mcp_session_provider(
     over time, e.g. a reconnecting :class:`~agent_framework.MCPTool`).
 
     Args:
-        client: A fixed MCP client session, or ``None``.
+        client: A fixed MCP client or session, or ``None``.
         session_provider: A callable returning the current MCP client session,
             or ``None``.
 
     Returns:
-        A callable that returns the MCP client session to use.
+        A callable that returns the MCP client or session to use.
 
     Raises:
         ValueError: If both or neither of *client* and *session_provider* are
             provided.
     """
-    if client is not None and session_provider is not None:
-        raise ValueError("Provide exactly one of 'client' or 'session_provider', not both.")
     if session_provider is not None:
-        return session_provider
+        if client is not None:
+            raise ValueError("Provide exactly one of 'client' or 'session_provider'.")
+        return lambda: _as_mcp_connection(session_provider())
+
     if client is None:
         raise ValueError("Provide exactly one of 'client' or 'session_provider'.")
-    fixed: ClientSession = client
+
+    fixed = _as_mcp_connection(client)
     return lambda: fixed
 
 
@@ -4712,9 +4716,9 @@ class MCPSkill(Skill):
         self,
         frontmatter: SkillFrontmatter,
         skill_md_uri: str,
-        client: ClientSession | None = None,
+        client: Client | ClientSession | None = None,
         *,
-        session_provider: Callable[[], ClientSession] | None = None,
+        session_provider: Callable[[], Client | ClientSession] | None = None,
     ) -> None:
         """Initialize an MCPSkill.
 
@@ -4744,7 +4748,7 @@ class MCPSkill(Skill):
         self._frontmatter = frontmatter
         self._skill_md_uri = skill_md_uri
         self._skill_root_uri = self._compute_skill_root_uri(skill_md_uri)
-        self._session_provider = _resolve_mcp_session_provider(client, session_provider)
+        self._session_provider = _resolve_mcp_connection_provider(client, session_provider)
         self._content: str | None = None
 
     @property
@@ -5082,7 +5086,7 @@ class _ArchiveEntryLoader:
 
     def __init__(
         self,
-        session_provider: Callable[[], ClientSession],
+        session_provider: Callable[[], _MCPConnection],
         *,
         resource_extensions: tuple[str, ...] | None,
         resource_search_depth: int,
@@ -5415,9 +5419,9 @@ class MCPSkillsSource(SkillsSource):
 
     def __init__(
         self,
-        client: ClientSession | None = None,
+        client: Client | ClientSession | None = None,
         *,
-        session_provider: Callable[[], ClientSession] | None = None,
+        session_provider: Callable[[], Client | ClientSession] | None = None,
         archive_resource_extensions: tuple[str, ...] | None = None,
         archive_resource_search_depth: int = DEFAULT_SEARCH_DEPTH,
         archive_max_file_count: int = _DEFAULT_ARCHIVE_MAX_FILE_COUNT,
@@ -5429,7 +5433,7 @@ class MCPSkillsSource(SkillsSource):
         Provide **exactly one** of *client* or *session_provider*.
 
         Args:
-            client: A fixed MCP client session connected to a server that exposes
+            client: A fixed MCP client or clientsession connected to a server that exposes
                 Agent Skills resources. Use this when the session outlives the
                 source (e.g. a caller-owned long-lived session).
 
@@ -5463,7 +5467,7 @@ class MCPSkillsSource(SkillsSource):
             ValueError: If both or neither of *client* and *session_provider* are
                 provided.
         """
-        self._session_provider = _resolve_mcp_session_provider(client, session_provider)
+        self._session_provider = _resolve_mcp_connection_provider(client, session_provider)
         self._archive_loader = _ArchiveEntryLoader(
             self._session_provider,
             resource_extensions=archive_resource_extensions,
@@ -5554,6 +5558,10 @@ class MCPSkillsSource(SkillsSource):
             logger.warning("Failed to parse skill://index.json JSON document.", exc_info=True)
             return None
 
+    def _current_client(self) -> Client | ClientSession:
+        connection = self._session_provider()
+        return connection.client if connection.client is not None else connection.session
+
     def _try_create_skill(self, entry: _McpSkillIndexEntry) -> MCPSkill | None:
         """Attempt to create an :class:`MCPSkill` from a ``skill-md`` index entry.
 
@@ -5585,7 +5593,7 @@ class MCPSkillsSource(SkillsSource):
             logger.debug("Skipping entry '%s': invalid metadata: %s", entry.name, ex)
             return None
 
-        return MCPSkill(frontmatter=fm, skill_md_uri=entry.url, session_provider=self._session_provider)
+        return MCPSkill(frontmatter=fm, skill_md_uri=entry.url, session_provider=self._current_client)
 
 
 # endregion
