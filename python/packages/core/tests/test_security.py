@@ -6935,8 +6935,8 @@ class TestMCPIFCMetaLabels:
         await apply_mcp_security_labels(mcp_tool)
 
         assert sdk_client.list_tools.await_args_list == [
-            call(cursor=None, cache_mode="bypass"),
-            call(cursor="next-page", cache_mode="bypass"),
+            call(cursor=None, cache_mode="use"),
+            call(cursor="next-page", cache_mode="use"),
         ]
         sdk_client.session.list_tools.assert_not_awaited()
 

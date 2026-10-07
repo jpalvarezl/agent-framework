@@ -113,20 +113,18 @@ Absent server hints use `CacheConfig.default_ttl_ms`, whose default is `0`. Unde
 request metadata forces a wire refresh. Although `server/discover` carries protocol cache hints, SDK 2.2.0 deliberately
 excludes it from the response cache; persisting or reusing `prior_discover` is caller-managed.
 
-The Client-first cleanup and the separate Caching checklist item are staged deliberately:
+Framework-owned connections use the SDK's default `cache_mode="use"` for tool and prompt catalogs and resource
+reads. Modern server-provided `ttlMs` / `cacheScope` hints therefore control freshness. Legacy peers provide no
+hints and remain uncached under the SDK's default zero TTL; caller-supplied `ClientSession` connections bypass the
+SDK response cache.
 
-1. While preserving pre-caching Agent Framework behavior, explicit catalog and resource refresh paths use
-   `cache_mode="bypass"`.
-2. The Caching migration later assigns an intentional policy per operation:
-   - `"refresh"` for an explicit authoritative refetch that must update or evict the SDK cache;
-   - `"use"` only where Agent Framework intentionally accepts server `ttlMs` / `cacheScope` freshness;
-   - `"bypass"` only where neither reading nor updating the SDK cache is desired.
-3. Resource and catalog refresh tests must cover positive TTLs, pagination, changed metadata, empty snapshots,
-   reconnect, and authenticated identity changes.
-4. A reconnect or effective header-identity change replaces the whole Client and its default per-client cache. A
-   shared cache store must be partitioned by a verified authorization identity. Because Agent Framework constructs
-   `Client` from a transport rather than a URL, a future shared store also requires an explicit stable
-   `CacheConfig.target_id`.
+Agent Framework does not expose a cache-mode or shared-cache configuration surface. A reconnect or effective
+header-identity change replaces the whole Client and its default per-client cache. Exposing a shared store would
+require a separate authorization-partition design and, because Agent Framework constructs `Client` from a transport
+rather than a URL, an explicit stable `CacheConfig.target_id`.
+
+Resource and catalog cache tests cover positive TTLs, pagination, empty snapshots, reconnect, notifications, and
+authenticated identity changes.
 
 MRTR-seeded and MRTR-resolved resource reads are not cached by the SDK.
 

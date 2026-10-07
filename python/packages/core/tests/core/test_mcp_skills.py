@@ -573,7 +573,7 @@ class TestMCPSkill:
 class TestMCPSkillsSource:
     """Tests for MCPSkillsSource."""
 
-    async def test_high_level_client_reads_resources_with_cache_bypass(self) -> None:
+    async def test_high_level_client_reads_resources_with_cache(self) -> None:
         from mcp import Client
         from mcp.server import Server, ServerRequestContext
         from mcp.types import ReadResourceRequestParams
@@ -600,9 +600,45 @@ class TestMCPSkillsSource:
 
         assert content == SAMPLE_SKILL_MD
         assert read_resource_mock.await_args_list == [
-            call("skill://index.json", cache_mode="bypass"),
-            call("skill://unit-converter/SKILL.md", cache_mode="bypass"),
+            call("skill://index.json", cache_mode="use"),
+            call("skill://unit-converter/SKILL.md", cache_mode="use"),
         ]
+
+    async def test_high_level_client_honors_positive_resource_ttl(self) -> None:
+        from mcp import Client
+        from mcp.server import Server, ServerRequestContext
+        from mcp.types import ReadResourceRequestParams
+
+        read_counts: dict[str, int] = {}
+
+        async def read_resource(
+            _ctx: ServerRequestContext[Any],
+            params: ReadResourceRequestParams,
+        ) -> ReadResourceResult:
+            uri = str(params.uri)
+            read_counts[uri] = read_counts.get(uri, 0) + 1
+            if uri == "skill://index.json":
+                return ReadResourceResult(
+                    contents=[TextResourceContents(uri=uri, text=SAMPLE_SKILL_INDEX, mime_type="application/json")],
+                    ttl_ms=60_000,
+                )
+            return ReadResourceResult(
+                contents=[TextResourceContents(uri=uri, text=SAMPLE_SKILL_MD, mime_type="text/markdown")],
+                ttl_ms=60_000,
+            )
+
+        server = Server("cached-skills-server", on_read_resource=read_resource)
+
+        async with Client(server) as client:
+            for _ in range(2):
+                source = MCPSkillsSource(client=client)
+                skill = (await source.get_skills(_SOURCE_CTX))[0]
+                assert await skill.get_content() == SAMPLE_SKILL_MD
+
+        assert read_counts == {
+            "skill://index.json": 1,
+            "skill://unit-converter/SKILL.md": 1,
+        }
 
     async def test_high_level_client_drives_state_only_mrtr_for_skill_resource(self) -> None:
         from mcp import Client

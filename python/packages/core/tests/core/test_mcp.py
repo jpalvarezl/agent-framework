@@ -5033,8 +5033,8 @@ async def test_get_prompt_uses_sdk_client_for_framework_owned_connection() -> No
     session.get_prompt.assert_not_awaited()
 
 
-async def test_catalog_loading_uses_sdk_client_without_cache() -> None:
-    """Test framework-owned catalog pagination uses the Client without caching."""
+async def test_catalog_loading_uses_sdk_client_cache() -> None:
+    """Test framework-owned catalog pagination uses the Client cache."""
     capabilities = types.ServerCapabilities(
         tools=types.ToolsCapability(),
         prompts=types.PromptsCapability(),
@@ -5079,15 +5079,288 @@ async def test_catalog_loading_uses_sdk_client_without_cache() -> None:
             ]
 
     assert [awaited.kwargs for awaited in sdk_client.list_tools.await_args_list] == [
-        {"cursor": None, "cache_mode": "bypass"},
-        {"cursor": "tools-next", "cache_mode": "bypass"},
+        {"cursor": None, "cache_mode": "use"},
+        {"cursor": "tools-next", "cache_mode": "use"},
     ]
     assert [awaited.kwargs for awaited in sdk_client.list_prompts.await_args_list] == [
-        {"cursor": None, "cache_mode": "bypass"},
-        {"cursor": "prompts-next", "cache_mode": "bypass"},
+        {"cursor": None, "cache_mode": "use"},
+        {"cursor": "prompts-next", "cache_mode": "use"},
     ]
     session.list_tools.assert_not_awaited()
     session.list_prompts.assert_not_awaited()
+
+
+async def test_catalog_loading_honors_positive_server_ttl() -> None:
+    from mcp.server import Server, ServerRequestContext
+
+    tool_list_count = 0
+    prompt_list_count = 0
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        nonlocal tool_list_count
+        tool_list_count += 1
+        return types.ListToolsResult(
+            tools=[types.Tool(name="cached_tool", input_schema={"type": "object", "properties": {}})],
+            ttl_ms=60_000,
+        )
+
+    async def list_prompts(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListPromptsResult:
+        nonlocal prompt_list_count
+        prompt_list_count += 1
+        return types.ListPromptsResult(
+            prompts=[types.Prompt(name="cached_prompt", arguments=[])],
+            ttl_ms=60_000,
+        )
+
+    server = Server(
+        "cache-server",
+        on_list_tools=list_tools,
+        on_list_prompts=list_prompts,
+    )
+    tool = _mcp_tool_for_in_process_server(server, load_tools=True, load_prompts=True)
+
+    async with tool:
+        await tool.load_tools()
+        await tool.load_prompts()
+
+    assert tool_list_count == 1
+    assert prompt_list_count == 1
+    assert [function.name for function in tool.functions] == ["cached_tool", "cached_prompt"]
+
+
+async def test_tool_catalog_cache_reuses_only_first_page() -> None:
+    from mcp.server import Server, ServerRequestContext
+
+    requested_cursors: list[str | None] = []
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        cursor = params.cursor if params is not None else None
+        requested_cursors.append(cursor)
+        if cursor is None:
+            return types.ListToolsResult(
+                tools=[types.Tool(name="first", input_schema={"type": "object", "properties": {}})],
+                next_cursor="second",
+                ttl_ms=60_000,
+            )
+        assert cursor == "second"
+        return types.ListToolsResult(
+            tools=[types.Tool(name="second", input_schema={"type": "object", "properties": {}})],
+            ttl_ms=60_000,
+        )
+
+    server = Server("paginated-cache-server", on_list_tools=list_tools)
+    tool = _mcp_tool_for_in_process_server(server, load_tools=True, load_prompts=False)
+
+    async with tool:
+        await tool.load_tools()
+
+    assert requested_cursors == [None, "second", "second"]
+    assert [function.name for function in tool.functions] == ["first", "second"]
+
+
+async def test_tool_catalog_cache_preserves_empty_snapshot() -> None:
+    from mcp.server import Server, ServerRequestContext
+
+    list_count = 0
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        nonlocal list_count
+        list_count += 1
+        return types.ListToolsResult(tools=[], ttl_ms=60_000)
+
+    server = Server("empty-cache-server", on_list_tools=list_tools)
+    tool = _mcp_tool_for_in_process_server(server, load_tools=True, load_prompts=False)
+
+    async with tool:
+        await tool.load_tools()
+
+    assert list_count == 1
+    assert tool.functions == []
+
+
+async def test_reconnect_replaces_catalog_cache() -> None:
+    from mcp.server import Server, ServerRequestContext
+
+    list_count = 0
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        nonlocal list_count
+        list_count += 1
+        return types.ListToolsResult(
+            tools=[types.Tool(name=f"tool_{list_count}", input_schema={"type": "object", "properties": {}})],
+            ttl_ms=60_000,
+        )
+
+    server = Server("reconnect-cache-server", on_list_tools=list_tools)
+    tool = _mcp_tool_for_in_process_server(server, load_tools=True, load_prompts=False)
+
+    async with tool:
+        await tool.load_tools()
+        assert list_count == 1
+        assert [function.name for function in tool.functions] == ["tool_1"]
+
+        await tool.connect(reset=True)
+        assert list_count == 2
+        assert [function.name for function in tool.functions] == ["tool_2"]
+
+
+async def test_modern_subscription_evicts_tool_catalog_cache() -> None:
+    from mcp.client._memory import InMemoryTransport
+    from mcp.server import Server, ServerRequestContext
+    from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler, ToolsListChanged
+
+    current_name = "first"
+    list_count = 0
+    refreshed = asyncio.Event()
+    bus = InMemorySubscriptionBus()
+    listen_handler = ListenHandler(bus)
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        nonlocal list_count
+        list_count += 1
+        if list_count == 2:
+            refreshed.set()
+        return types.ListToolsResult(
+            tools=[types.Tool(name=current_name, input_schema={"type": "object", "properties": {}})],
+            ttl_ms=60_000,
+        )
+
+    server = Server(
+        "subscription-cache-server",
+        on_list_tools=list_tools,
+        on_subscriptions_listen=listen_handler,
+    )
+    tool = _mcp_tool_for_in_process_server(
+        InMemoryTransport(server),
+        load_tools=True,
+        load_prompts=False,
+    )
+
+    async with tool:
+        assert tool.session is not None
+        assert tool.session.protocol_version == "2026-07-28"
+        await tool.load_tools()
+        assert list_count == 1
+
+        current_name = "second"
+        await bus.publish(ToolsListChanged())
+        await asyncio.wait_for(refreshed.wait(), timeout=1)
+        await asyncio.gather(*tool._pending_reload_tasks)
+
+        assert list_count == 2
+        assert [function.name for function in tool.functions] == ["second"]
+        listen_handler.close()
+
+
+async def test_caller_supplied_session_remains_uncached() -> None:
+    from mcp import Client
+    from mcp.server import Server, ServerRequestContext
+
+    list_count = 0
+
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        nonlocal list_count
+        list_count += 1
+        return types.ListToolsResult(
+            tools=[types.Tool(name="uncached", input_schema={"type": "object", "properties": {}})],
+            ttl_ms=60_000,
+        )
+
+    server = Server("session-cache-server", on_list_tools=list_tools)
+
+    async with Client(server) as client:
+        tool = MCPStdioTool(
+            name="caller-owned",
+            command="unused",
+            session=client.session,
+            load_prompts=False,
+        )
+        async with tool:
+            await tool.load_tools()
+
+    assert list_count == 2
+
+
+async def test_authorization_identity_change_replaces_catalog_cache() -> None:
+    list_principals: list[str] = []
+
+    async def handle(request: Request) -> Response:
+        if request.method == "DELETE":
+            return Response(200)
+        if request.method == "GET":
+            return Response(405)
+        body = json.loads(request.content)
+        method = body["method"]
+        principal = request.headers.get("Authorization", "")
+        if method == "server/discover":
+            result = {
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+            }
+        elif method == "tools/list":
+            list_principals.append(principal)
+            result = {
+                "resultType": "complete",
+                "ttlMs": 60_000,
+                "cacheScope": "private",
+                "tools": [
+                    {"name": "noop", "inputSchema": {"type": "object", "properties": {}}},
+                    {"name": f"{principal}-only", "inputSchema": {"type": "object", "properties": {}}},
+                ],
+            }
+        elif method == "tools/call":
+            result = {
+                "resultType": "complete",
+                "content": [{"type": "text", "text": principal}],
+                "isError": False,
+            }
+        else:
+            raise AssertionError(f"Unexpected MCP method: {method}")
+        return Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+    user_client = AsyncClient(transport=MockTransport(handle))
+    tool = MCPStreamableHTTPTool(
+        name="identity-cache",
+        url="https://mcp.example/mcp",
+        http_client=user_client,
+        load_prompts=False,
+        header_provider=lambda kwargs: {"Authorization": kwargs.get("credential", "token-a")},
+    )
+
+    try:
+        await tool.connect()
+        await tool.load_tools()
+        assert list_principals == ["token-a"]
+
+        await tool.call_tool("noop", credential="token-b")
+        await tool.load_tools()
+
+        assert list_principals == ["token-a", "token-b"]
+        assert {function.name for function in tool.functions} == {"noop", "token-b-only"}
+    finally:
+        await tool.close()
+        await user_client.aclose()
 
 
 # Test error handling in connect() method

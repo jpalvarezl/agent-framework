@@ -5368,6 +5368,11 @@ class MCPSkillsSource(SkillsSource):
     already provides refresh/caching for any source, this source does not offer
     a separate refresh interval; wrap it in :class:`CachingSkillsSource` to cache.
 
+    When backed by a high-level MCP ``Client``, individual resource reads honor
+    modern server ``ttlMs`` / ``cacheScope`` hints through the SDK response cache.
+    A caller-supplied ``ClientSession`` remains uncached. This wire-response cache
+    is separate from :class:`CachingSkillsSource`, which caches the parsed skill list.
+
     Archive digests:
         An archive entry's non-null ``digest`` must be ``sha256:`` followed by
         64 lowercase hexadecimal characters. It is verified against the decoded

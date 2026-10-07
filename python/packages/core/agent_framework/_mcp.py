@@ -566,17 +566,15 @@ class _ClientMCPConnection:
         return await self.client.get_prompt(name, arguments=cast("dict[str, str] | None", arguments))
 
     async def list_tools_page(self, params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
-        """List one tools page without changing existing cache behavior."""
+        """List one tools page while honoring server cache hints."""
         return await self.client.list_tools(
             cursor=params.cursor if params is not None else None,
-            cache_mode="bypass",
         )
 
     async def list_prompts_page(self, params: types.PaginatedRequestParams | None) -> types.ListPromptsResult:
-        """List one prompts page without changing existing cache behavior."""
+        """List one prompts page while honoring server cache hints."""
         return await self.client.list_prompts(
             cursor=params.cursor if params is not None else None,
-            cache_mode="bypass",
         )
 
     async def set_logging_level(self, level: Any) -> None:
@@ -584,8 +582,8 @@ class _ClientMCPConnection:
         await self.session.set_logging_level(level)  # pyright: ignore[reportDeprecated]
 
     async def read_resource(self, uri: str) -> types.ReadResourceResult:
-        """Read a resource through the high-level Client."""
-        return await self.client.read_resource(uri, cache_mode="bypass")
+        """Read a resource through the high-level Client while honoring server cache hints."""
+        return await self.client.read_resource(uri, cache_mode="use")
 
 
 @dataclass(frozen=True)
@@ -1053,6 +1051,11 @@ class MCPTool:
     Note:
         MCPTool cannot be instantiated directly. Use one of the subclasses:
         MCPStdioTool or MCPStreamableHTTPTool.
+
+    Caching:
+        Framework-owned modern connections honor server-provided ``ttlMs`` and ``cacheScope`` hints through the
+        MCP SDK's per-Client response cache. Legacy servers and caller-supplied ``ClientSession`` connections remain
+        uncached under the default zero-TTL policy.
 
     Examples:
         See the subclass documentation for usage examples:
