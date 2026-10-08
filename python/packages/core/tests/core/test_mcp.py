@@ -8406,7 +8406,9 @@ async def test_mcp_streamable_http_tool_header_provider_sets_contextvar():
     async def spy_call_tool(self, tool_name, **kwargs):
         # Capture the contextvar value during the super call
         try:
-            observed_headers.append(_mcp_call_headers.get())
+            call_header_context = _mcp_call_headers.get()
+            assert isinstance(call_header_context, tuple)
+            observed_headers.append(call_header_context[1])
         except LookupError:
             observed_headers.append({})
         return await original_call_tool(self, tool_name, **kwargs)
@@ -8560,7 +8562,7 @@ async def test_mcp_streamable_http_tool_header_provider_with_httpx_event_hook():
             assert len(hooks) == 1, "Expected one request event hook"
 
             # Simulate what happens during a call_tool: contextvar is set
-            token = _mcp_call_headers.set({"X-Custom": "test-value"})
+            token = _mcp_call_headers.set((tool._header_request_owner, {"X-Custom": "test-value"}))
             try:
                 request = _request_for_mcp_tool(tool)
                 await hooks[0](request)
@@ -8662,7 +8664,7 @@ async def test_mcp_streamable_http_tool_header_provider_empty_active_call_skips_
             assert len(hooks) == 1
 
             # Simulate an active call whose provider returned {} (both ContextVar and snapshot set).
-            token = _mcp_call_headers.set({})
+            token = _mcp_call_headers.set((tool._header_request_owner, {}))
             tool._active_call_headers = {}
             try:
                 call_count = 0
@@ -8768,7 +8770,10 @@ async def test_mcp_streamable_http_tool_header_provider_skips_cross_origin_redir
             hooks = tool._httpx_client.event_hooks.get("request", [])
             assert len(hooks) == 1
 
-            token = _mcp_call_headers.set({"Authorization": "Bearer secret", "X-API-Key": "api-secret"})
+            token = _mcp_call_headers.set((
+                tool._header_request_owner,
+                {"Authorization": "Bearer secret", "X-API-Key": "api-secret"},
+            ))
             try:
                 same_origin = _request_for_mcp_tool(tool, "http://example.com/redirected")
                 await hooks[0](same_origin)
@@ -8873,7 +8878,7 @@ async def test_mcp_streamable_http_tool_header_provider_with_user_httpx_client(u
                 hooks = user_client.event_hooks["request"]
                 assert len(hooks) == int(use_header_provider)
                 if use_header_provider:
-                    token = _mcp_call_headers.set({"X-Dynamic": "per-request"})
+                    token = _mcp_call_headers.set((tool._header_request_owner, {"X-Dynamic": "per-request"}))
                     try:
                         request = _request_for_mcp_tool(tool)
                         await hooks[0](request)
@@ -9155,7 +9160,9 @@ async def test_mcp_streamable_http_tool_header_provider_via_invoke_with_context(
         # Capture the contextvar value set by call_tool before delegating
         result = await original_call_tool(self, tool_name, **kwargs)
         try:
-            observed_headers.append(_mcp_call_headers.get())
+            call_header_context = _mcp_call_headers.get()
+            assert isinstance(call_header_context, tuple)
+            observed_headers.append(call_header_context[1])
         except LookupError:
             observed_headers.append({})
         return result

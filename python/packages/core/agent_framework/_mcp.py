@@ -166,7 +166,8 @@ _MCP_FRAMEWORK_DENYLIST: frozenset[str] = frozenset({
     "response_format",
     "_meta",
 })
-_mcp_call_headers: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar("_mcp_call_headers")
+# object is a reference to the owner of the headers, so we keep track which headers belong to which tool
+_mcp_call_headers: contextvars.ContextVar[tuple[object, dict[str, str]]] = contextvars.ContextVar("_mcp_call_headers")
 _mcp_tool_runtime_context: contextvars.ContextVar[tuple[object, Mapping[str, Any]] | None] = contextvars.ContextVar(
     "_mcp_tool_runtime_context", default=None
 )
@@ -4315,11 +4316,17 @@ class MCPStreamableHTTPTool(MCPTool):
                     if self._header_provider is not None:
                         # The transport may send this request from a task whose context was
                         # captured before call_tool set the ContextVar; fall back to the
-                        # instance-level snapshot of the active call's headers. Both are None
-                        # only when this is an ambient request outside call_tool; an active
-                        # call that legitimately produced no headers yields an empty dict and
-                        # must not trigger the ambient fallback below.
-                        dynamic_headers = _mcp_call_headers.get(None)
+                        # instance-level snapshot of the active call's headers. Context values
+                        # are owner-tagged so a nested tool sharing the client cannot inherit
+                        # another tool's credentials. Both are None only when this is an ambient
+                        # request outside call_tool; an active call that legitimately produced
+                        # no headers yields an empty dict and must not trigger the ambient fallback.
+                        call_header_context = _mcp_call_headers.get(None)
+                        dynamic_headers = (
+                            call_header_context[1]
+                            if call_header_context is not None and call_header_context[0] is self._header_request_owner
+                            else None
+                        )
                         if dynamic_headers is None:
                             dynamic_headers = self._active_call_headers
                     else:
@@ -4538,7 +4545,7 @@ class MCPStreamableHTTPTool(MCPTool):
         headers = self._effective_headers(runtime_kwargs)
         async with self._call_headers_lock:
             await self._ensure_session_identity(headers, runtime_kwargs)
-            token = _mcp_call_headers.set(headers)
+            token = _mcp_call_headers.set((self._header_request_owner, headers))
             self._active_call_headers = headers
             try:
                 return await super()._call_prompt_with_runtime_kwargs(
@@ -4591,7 +4598,7 @@ class MCPStreamableHTTPTool(MCPTool):
             headers = self._effective_headers(header_kwargs)
             async with self._call_headers_lock:
                 await self._ensure_session_identity(headers, header_kwargs)
-                token = _mcp_call_headers.set(headers)
+                token = _mcp_call_headers.set((self._header_request_owner, headers))
                 self._active_call_headers = headers
                 try:
                     return await super().call_tool(tool_name, **kwargs)
