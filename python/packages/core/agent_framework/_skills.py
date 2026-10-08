@@ -4441,7 +4441,7 @@ class AggregatingSkillsSource(SkillsSource):
 
 
 def _is_mcp_resource_not_found(ex: Exception) -> bool:
-    """Return ``True`` when *ex* is an :class:`McpError` indicating a missing resource.
+    """Return ``True`` when *ex* is an :class:`MCPError` indicating a missing resource.
 
     Two codes are treated as "not found":
 

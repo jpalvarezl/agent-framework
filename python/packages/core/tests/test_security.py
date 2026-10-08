@@ -10,7 +10,7 @@ import warnings
 from datetime import timedelta
 from types import MappingProxyType, SimpleNamespace
 from typing import Annotated, Any, cast
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, call
 
 import pytest
 from pydantic import AfterValidator, BaseModel, field_validator
@@ -6141,7 +6141,7 @@ class TestSecureMCPToolProxyURLMode:
     async def test_headers_are_sent_only_to_the_configured_origin(self) -> None:
         from unittest.mock import patch
 
-        import httpx
+        import httpx2 as httpx
 
         from agent_framework._mcp import _MCPHeaderScopedClient
         from agent_framework.security import SecureMCPToolProxy
@@ -6215,7 +6215,7 @@ class TestSecureMCPToolProxyURLMode:
                 client.follow_redirects = kwargs.get("follow_redirects", client.follow_redirects)
                 return client
 
-            with patch("httpx.AsyncClient", side_effect=create_client):
+            with patch("httpx2.AsyncClient", side_effect=create_client):
                 proxy = SecureMCPToolProxy(
                     url="https://mcp.example/mcp",
                     headers=configured_headers,
@@ -6258,7 +6258,7 @@ class TestSecureMCPToolProxyURLMode:
 
         from agent_framework.security import SecureMCPToolProxy
 
-        with patch("httpx.AsyncClient") as create_client:
+        with patch("httpx2.AsyncClient") as create_client:
             proxy = SecureMCPToolProxy(url=url, headers={"X-Custom-Credential": "custom-value"})
 
             with pytest.raises(ValueError, match="absolute HTTP.*URL with a host"):
@@ -6345,8 +6345,9 @@ def _make_connected_mcp_tool_for_ifc(
     )
     mcp_tool = MCPTool(name="helper")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
     mcp_tool.is_connected = True
-    mcp_tool.session = AsyncMock()
-    mcp_tool.session.list_tools = AsyncMock(  # type: ignore[method-assign]
+    mock_session = AsyncMock()
+    mcp_tool.session = mock_session
+    mock_session.list_tools = AsyncMock(  # type: ignore[method-assign]
         return_value=SimpleNamespace(
             tools=[SimpleNamespace(name="remote_tool", annotations=annotations)],
             next_cursor=None,
@@ -6390,8 +6391,9 @@ def _make_connected_mcp_discovery_tool(
             always_load=always_load,
         )
     mcp_tool.is_connected = True
-    mcp_tool.session = AsyncMock()
-    mcp_tool.session.call_tool = AsyncMock(
+    mock_session = AsyncMock()
+    mcp_tool.session = mock_session
+    mock_session.call_tool = AsyncMock(
         return_value=mcp_types.CallToolResult(
             content=[mcp_types.TextContent(type="text", text="payload")],
             _meta=result_meta or {"ifc": {"integrity": "trusted", "confidentiality": "private"}},
@@ -6922,7 +6924,8 @@ class TestMCPIFCMetaLabels:
         annotations = SimpleNamespace(read_only_hint=True, open_world_hint=False)
         mcp_tool, _ = _make_connected_mcp_tool_for_ifc(annotations=annotations, server_meta={})
         sdk_client = AsyncMock()
-        sdk_client.session = AsyncMock()
+        mock_session = AsyncMock()
+        sdk_client.session = mock_session
         sdk_client.list_tools.side_effect = [
             SimpleNamespace(
                 tools=[SimpleNamespace(name="remote_tool", annotations=annotations)],
@@ -6935,10 +6938,10 @@ class TestMCPIFCMetaLabels:
         await apply_mcp_security_labels(mcp_tool)
 
         assert sdk_client.list_tools.await_args_list == [
-            call(cursor=None, cache_mode="use"),
-            call(cursor="next-page", cache_mode="use"),
+            call(cursor=None),
+            call(cursor="next-page"),
         ]
-        sdk_client.session.list_tools.assert_not_awaited()
+        mock_session.list_tools.assert_not_awaited()
 
     async def test_framework_stamped_mcp_label_remains_authoritative_through_tracking(self) -> None:
         from agent_framework.security import apply_mcp_security_labels

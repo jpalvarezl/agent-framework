@@ -94,8 +94,8 @@ _RESOURCE_NOT_FOUND_ERRORS = [_legacy_resource_not_found, _modern_resource_not_f
 
 
 def _make_client(
-    *,
     resource_not_found_error: Callable[[str], MCPError] = _legacy_resource_not_found,
+    /,
     **read_resource_responses: ReadResourceResult,
 ) -> AsyncMock:
     """Create a mock ClientSession whose read_resource returns different results per URI.
@@ -786,7 +786,7 @@ class TestMCPSkillsSource:
             ],
         })
         client = _make_client(
-            resource_not_found_error=resource_not_found_error,
+            resource_not_found_error,
             **{"skill://index.json": _make_text_result(index_json, uri="skill://index.json")},
         )
         source = MCPSkillsSource(client=client)
@@ -910,7 +910,7 @@ class TestMCPSkillsSourceErrorCodeBranching:
         resource_not_found_error: Callable[[str], MCPError],
     ) -> None:
         """Either valid missing-resource error shape means the server has no skill index."""
-        client = _make_client(resource_not_found_error=resource_not_found_error)
+        client = _make_client(resource_not_found_error)
         source = MCPSkillsSource(client=client)
         skills = await source.get_skills(_SOURCE_CTX)
         assert skills == []
@@ -989,7 +989,7 @@ class TestMCPSkillsSourceErrorCodeBranching:
         """Either valid missing-resource error shape on get_resource returns None."""
         from agent_framework import SkillFrontmatter
 
-        client = _make_client(resource_not_found_error=resource_not_found_error)
+        client = _make_client(resource_not_found_error)
         fm = SkillFrontmatter(name="test-skill", description="Test.")
         skill = MCPSkill(frontmatter=fm, skill_md_uri="skill://test/SKILL.md", client=client)
         result = await skill.get_resource("references/file.md")

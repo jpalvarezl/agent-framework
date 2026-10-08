@@ -33,7 +33,6 @@ from agent_framework import (
     FunctionTool,
     MCPStdioTool,
     MCPStreamableHTTPTool,
-    MCPWebsocketTool,
     Message,
     SupportsChatGetResponse,
 )
@@ -232,7 +231,7 @@ def _reset_progressive_mcp_warning_state() -> None:
 
 
 def _request_for_mcp_tool(tool: MCPStreamableHTTPTool, url: str = "http://example.com/mcp") -> Any:
-    import httpx
+    import httpx2 as httpx
 
     return httpx.Request(
         "POST",
@@ -341,8 +340,9 @@ async def test_load_tools_rejects_ambiguous_policy_names(
             return types.ListToolsResult(tools=advertised_tools[1:])
         return types.ListToolsResult(tools=advertised_tools)
 
-    tool.session = AsyncMock()
-    tool.session.list_tools = AsyncMock(side_effect=list_tools)
+    mock_session = AsyncMock()
+    tool.session = mock_session
+    mock_session.list_tools = AsyncMock(side_effect=list_tools)
 
     with pytest.raises(ToolExecutionException, match="configuration name 'docs_search' is ambiguous"):
         await tool.load_tools()
@@ -373,13 +373,14 @@ async def test_ambiguous_policy_reload_preserves_previous_discovery(
     tool = MCPTool(  # type: ignore[abstract]  # ty: ignore[call-non-callable]
         name="docs", tool_name_prefix="docs", allowed_tools=allowed_tools, approval_mode=approval_mode
     )
-    tool.session = AsyncMock()
+    mock_session = AsyncMock()
+    tool.session = mock_session
     original = types.Tool(
         name=remote_names[0],
         input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
         _meta={"original": True},
     )
-    tool.session.list_tools = AsyncMock(return_value=types.ListToolsResult(tools=[original]))
+    mock_session.list_tools = AsyncMock(return_value=types.ListToolsResult(tools=[original]))
     await tool.load_tools()
     original_functions = list(tool._functions)
     original_meta = dict(tool._tool_call_meta_by_name)
@@ -395,7 +396,7 @@ async def test_ambiguous_policy_reload_preserves_previous_discovery(
             )
         return types.ListToolsResult(tools=[types.Tool(name=remote_names[1], input_schema={"type": "object"})])
 
-    tool.session.list_tools = AsyncMock(side_effect=list_tools)
+    mock_session.list_tools = AsyncMock(side_effect=list_tools)
     with caplog.at_level(logging.WARNING, logger=logger.name):
         await tool.message_handler(types.ToolListChangedNotification())
         await asyncio.gather(*tool._pending_reload_tasks)
@@ -427,8 +428,9 @@ async def test_tool_refresh_accepts_unambiguous_rename(
     tool = MCPTool(  # type: ignore[abstract]  # ty: ignore[call-non-callable]
         name="docs", tool_name_prefix="docs", allowed_tools=allowed_tools, approval_mode=approval_mode
     )
-    tool.session = AsyncMock()
-    tool.session.list_tools = AsyncMock(
+    mock_session = AsyncMock()
+    tool.session = mock_session
+    mock_session.list_tools = AsyncMock(
         side_effect=[
             types.ListToolsResult(tools=[types.Tool(name=name, input_schema={"type": "object"})])
             for name in remote_names
@@ -440,17 +442,18 @@ async def test_tool_refresh_accepts_unambiguous_rename(
 
     assert [function.name for function in tool.functions] == [f"docs_{remote_names[1]}"]
     assert tool.functions[0].approval_mode == expected_approval
-    tool.session.call_tool = AsyncMock(
+    mock_session.call_tool = AsyncMock(
         return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
     )
     await tool.functions[0].invoke(arguments={})
-    assert tool.session.call_tool.call_args.args[0] == remote_names[1]
+    assert mock_session.call_tool.call_args.args[0] == remote_names[1]
 
 
 @pytest.mark.parametrize("empty_snapshot", [False, True])
 async def test_tool_refresh_replaces_snapshot_and_preserves_other_functions(empty_snapshot: bool) -> None:
     tool = MCPTool(name="docs", tool_name_prefix="docs")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = AsyncMock()
+    mock_session = AsyncMock()
+    tool.session = mock_session
     keep = types.Tool(
         name="keep",
         input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
@@ -462,12 +465,12 @@ async def test_tool_refresh_replaces_snapshot_and_preserves_other_functions(empt
         _meta={"version": 1},
         execution=types.ToolExecution(task_support="required"),
     )
-    tool.session.list_tools = AsyncMock(return_value=types.ListToolsResult(tools=[keep, removed]))
+    mock_session.list_tools = AsyncMock(return_value=types.ListToolsResult(tools=[keep, removed]))
     await tool.load_tools()
     kept_function = tool._functions[0]
     parser = Mock(return_value="custom result")
     kept_function.result_parser = parser
-    tool.session.list_prompts = AsyncMock(return_value=types.ListPromptsResult(prompts=[types.Prompt(name="summary")]))
+    mock_session.list_prompts = AsyncMock(return_value=types.ListPromptsResult(prompts=[types.Prompt(name="summary")]))
     await tool.load_prompts()
     prompt_function = tool._functions[-1]
     custom_function = FunctionTool(name="custom", func=lambda: "custom")
@@ -485,7 +488,7 @@ async def test_tool_refresh_replaces_snapshot_and_preserves_other_functions(empt
         assert params.cursor == "second"
         return types.ListToolsResult(tools=[] if empty_snapshot else [keep])
 
-    tool.session.list_tools = AsyncMock(side_effect=list_tools)
+    mock_session.list_tools = AsyncMock(side_effect=list_tools)
     await tool.load_tools()
 
     assert tool._functions is original_list
@@ -504,11 +507,12 @@ async def test_tool_refresh_replaces_snapshot_and_preserves_other_functions(empt
 
 async def test_tool_refresh_preserves_prompt_when_server_advertises_same_raw_name() -> None:
     tool = MCPTool(name="docs")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = AsyncMock()
-    tool.session.list_prompts = AsyncMock(return_value=types.ListPromptsResult(prompts=[types.Prompt(name="summary")]))
+    mock_session = AsyncMock()
+    tool.session = mock_session
+    mock_session.list_prompts = AsyncMock(return_value=types.ListPromptsResult(prompts=[types.Prompt(name="summary")]))
     await tool.load_prompts()
     prompt_function = tool._functions[0]
-    tool.session.list_tools = AsyncMock(
+    mock_session.list_tools = AsyncMock(
         side_effect=[
             types.ListToolsResult(tools=[types.Tool(name="summary", input_schema={"type": "object"})]),
             types.ListToolsResult(tools=[]),
@@ -578,8 +582,9 @@ async def test_overlapping_names_accept_unambiguous_policy(
             "never_require_approval": ["search", "docs_docs_search"],
         },
     )
-    tool.session = AsyncMock()
-    tool.session.list_tools = AsyncMock(
+    mock_session = AsyncMock()
+    tool.session = mock_session
+    mock_session.list_tools = AsyncMock(
         return_value=types.ListToolsResult(
             tools=[
                 types.Tool(name=name, input_schema={"type": "object", "properties": {}})
@@ -604,8 +609,9 @@ async def test_prompts_reject_ambiguous_policy_names(load_order: str) -> None:
         tool_name_prefix="docs",
         allowed_tools=["docs_search"],
     )
-    tool.session = AsyncMock()
-    tool.session.list_prompts = AsyncMock(
+    mock_session = AsyncMock()
+    tool.session = mock_session
+    mock_session.list_prompts = AsyncMock(
         side_effect=[
             types.ListPromptsResult(prompts=[types.Prompt(name="search")], next_cursor="second"),
             types.ListPromptsResult(prompts=[types.Prompt(name="docs_search")]),
@@ -617,12 +623,12 @@ async def test_prompts_reject_ambiguous_policy_names(load_order: str) -> None:
         assert tool._functions == []
         return
 
-    tool.session.list_tools = AsyncMock(
+    mock_session.list_tools = AsyncMock(
         return_value=types.ListToolsResult(
             tools=[types.Tool(name="search", input_schema={"type": "object", "properties": {}})]
         )
     )
-    tool.session.list_prompts = AsyncMock(
+    mock_session.list_prompts = AsyncMock(
         return_value=types.ListPromptsResult(prompts=[types.Prompt(name="docs_search")])
     )
     first_load, second_load = (
@@ -1057,8 +1063,9 @@ async def test_generated_mcp_tool_preserves_complete_host_payload_once() -> None
         _meta={"widget": "image"},
     )
     tool = MCPTool(name="helper")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(tool, "widget")
     assert function_result.items is not None
@@ -1092,8 +1099,9 @@ async def test_generated_mcp_host_payload_replaces_duplicate_private_markers() -
             Content.from_text("two", additional_properties=stale),
         ],
     )
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(tool, "widget")
 
@@ -1112,8 +1120,9 @@ async def test_custom_mcp_result_parser_preserves_direct_shape_and_generated_hos
         _meta={"source": "server"},
     )
     tool = MCPTool(name="helper", parse_tool_results=lambda _: "Custom model summary")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     direct_result = await tool.call_tool("widget")
     function_result = await _call_generated_mcp_tool(tool, "widget")
@@ -1142,8 +1151,9 @@ async def test_oversized_mcp_host_payload_is_omitted_without_changing_model_resu
         parse_tool_results=lambda _: "Bounded model summary",
         max_host_payload_size_bytes=128,
     )
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     with caplog.at_level(logging.WARNING):
         function_result = await _call_generated_mcp_tool(tool, "widget")
@@ -1208,8 +1218,9 @@ async def test_generated_mcp_error_preserves_complete_host_payload_on_function_r
         _meta={"source": "server"},
     )
     tool = MCPTool(name="helper")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(tool, "widget")
     host_payload = function_result.additional_properties[_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY]
@@ -1229,8 +1240,9 @@ async def test_generated_mcp_parser_failure_preserves_complete_host_payload_on_f
         _meta={"source": "server"},
     )
     tool = MCPTool(name="helper", parse_tool_results=_raise_result_parser)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(tool, "widget")
 
@@ -1249,8 +1261,9 @@ async def test_direct_mcp_calls_do_not_materialize_host_payload(monkeypatch: pyt
         name="helper",
         parse_tool_results=lambda result: cast(types.TextContent, result.content[0]).text,
     )
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(side_effect=[success, error])
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(side_effect=[success, error])
 
     def fail_if_captured(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("direct calls must not materialize Host metadata")
@@ -1265,8 +1278,9 @@ async def test_direct_mcp_calls_do_not_materialize_host_payload(monkeypatch: pyt
 
 async def test_direct_mcp_parser_failure_does_not_materialize_host_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     tool = MCPTool(name="helper", parse_tool_results=_raise_result_parser)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(
         return_value=types.CallToolResult(
             content=[types.TextContent(type="text", text="ok")],
             _meta={"source": "server"},
@@ -1290,8 +1304,9 @@ async def test_function_tool_result_parser_cannot_discard_mcp_host_payload() -> 
         _meta={"source": "server"},
     )
     tool = MCPTool(name="helper", parse_tool_results=lambda _: "MCP parser projection")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(
         tool,
@@ -1318,8 +1333,9 @@ async def test_empty_custom_parser_projection_remains_empty(parser_layer: str) -
         name="helper",
         parse_tool_results=(lambda _: []) if parser_layer == "mcp" else None,
     )
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(
         tool,
@@ -1342,8 +1358,9 @@ async def test_oversized_mcp_error_preserves_independently_bounded_meta() -> Non
         _meta={"source": "small"},
     )
     tool = MCPTool(name="helper", max_host_payload_size_bytes=128)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(tool, "widget")
 
@@ -1387,8 +1404,9 @@ async def test_exhausted_aggregate_budget_rejects_meta_before_copy(monkeypatch: 
         parse_tool_results=lambda _: "model projection",
         max_host_payload_size_bytes=128,
     )
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
     budget = _FunctionResultPayloadBudget()
     assert budget.reserve(128, 128)
 
@@ -1410,8 +1428,9 @@ async def test_oversized_mcp_meta_is_omitted_from_host_and_model_items() -> None
         _meta={"large": "x" * 1024},
     )
     tool = MCPTool(name="helper", max_host_payload_size_bytes=128)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(tool, "widget")
 
@@ -1433,8 +1452,9 @@ async def test_mcp_host_payload_survives_real_function_loop(
         _meta={"source": "server"},
     )
     tool = MCPTool(name="helper")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
     function = FunctionTool(
         name="widget",
         description="",
@@ -1528,7 +1548,8 @@ async def test_mcp_host_payload_has_aggregate_request_budget(
     expected_markers: int,
 ) -> None:
     tool = MCPTool(name="helper", max_host_payload_size_bytes=size_limit)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
+    mock_session = Mock()
+    tool.session = mock_session
 
     async def call_tool(tool_name: str, **_kwargs: Any) -> types.CallToolResult:
         return types.CallToolResult(
@@ -1537,7 +1558,7 @@ async def test_mcp_host_payload_has_aggregate_request_budget(
             _meta={"source": tool_name * 12},
         )
 
-    tool.session.call_tool = AsyncMock(side_effect=call_tool)
+    mock_session.call_tool = AsyncMock(side_effect=call_tool)
     functions = [
         FunctionTool(
             name=name,
@@ -1602,8 +1623,9 @@ async def test_secure_mcp_auto_hide_preserves_outer_host_payload() -> None:
             Content.from_text("untrusted payload", additional_properties={"_meta": result.meta})
         ],
     )
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
     function = FunctionTool(
         name="widget",
         description="",
@@ -1659,8 +1681,9 @@ async def test_secure_mcp_builtin_parser_restricts_all_result_shapes(result_shap
         _meta={"ifc": {"integrity": "trusted", "confidentiality": "public"}},
     )
     tool = MCPTool(name="helper")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
     function = FunctionTool(
         name="widget",
         description="",
@@ -1701,8 +1724,9 @@ async def test_secure_mcp_builtin_parser_honors_locally_trusted_server_ifc() -> 
         _meta={"ifc": {"integrity": "trusted", "confidentiality": "public"}},
     )
     tool = MCPTool(name="helper")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(
         tool,
@@ -1730,8 +1754,9 @@ async def test_custom_mcp_parser_cannot_make_meta_authoritative() -> None:
         name="helper",
         parse_tool_results=lambda _: [Content.from_text("projection", additional_properties={"_meta": forged_meta})],
     )
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(return_value=mcp_result)
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(return_value=mcp_result)
 
     function_result = await _call_generated_mcp_tool(
         tool,
@@ -2362,9 +2387,10 @@ async def test_local_mcp_server_load_functions():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
             # Mock tools list response
-            self.session.list_tools = AsyncMock(
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2398,9 +2424,10 @@ async def test_local_mcp_server_load_prompts():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
             # Mock prompts list response
-            self.session.list_prompts = AsyncMock(
+            mock_session.list_prompts = AsyncMock(
                 return_value=types.ListPromptsResult(
                     prompts=[
                         types.Prompt(
@@ -2427,8 +2454,9 @@ async def test_mcp_tool_call_tool_with_meta_integration():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2450,7 +2478,7 @@ async def test_mcp_tool_call_tool_with_meta_integration():
                 _meta={"executionTime": 1.5, "cost": {"usd": 0.002}, "isError": False, "toolVersion": "1.2.3"},
             )
 
-            self.session.call_tool = AsyncMock(return_value=tool_result)
+            mock_session.call_tool = AsyncMock(return_value=tool_result)
 
         def get_mcp_client(self) -> _AsyncGeneratorContextManager[Any, None]:
             return None  # type: ignore[return-value]  # pyrefly: ignore[bad-return]  # ty: ignore[invalid-return-type]
@@ -2472,8 +2500,9 @@ async def test_local_mcp_server_function_execution():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2488,7 +2517,7 @@ async def test_local_mcp_server_function_execution():
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(
                     content=[types.TextContent(type="text", text="Tool executed successfully")]
                 )
@@ -2512,8 +2541,9 @@ async def test_local_mcp_server_function_execution_with_nested_object():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2534,7 +2564,7 @@ async def test_local_mcp_server_function_execution_with_nested_object():
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(
                     content=[types.TextContent(type="text", text='{"name": "John Doe", "id": 251}')]
                 )
@@ -2565,8 +2595,9 @@ async def test_local_mcp_server_function_execution_error():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2582,7 +2613,7 @@ async def test_local_mcp_server_function_execution_error():
                 )
             )
             # Mock a tool call that raises an MCP error
-            self.session.call_tool = AsyncMock(side_effect=MCPError(-1, "Tool execution failed"))
+            mock_session.call_tool = AsyncMock(side_effect=MCPError(-1, "Tool execution failed"))
 
         def get_mcp_client(self) -> _AsyncGeneratorContextManager[Any, None]:
             return None  # type: ignore[return-value]  # pyrefly: ignore[bad-return]  # ty: ignore[invalid-return-type]
@@ -2607,12 +2638,13 @@ async def test_mcp_tool_reconnects_after_session_terminated_error():
 
         async def connect(self, *, reset: bool = False) -> None:
             self.connect_count += 1
-            self.session = Mock(spec=ClientSession)
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
             self.sessions.append(self.session)
             if self.connect_count == 1:
-                self.session.call_tool = AsyncMock(side_effect=MCPError(-32000, "Session terminated"))
+                mock_session.call_tool = AsyncMock(side_effect=MCPError(-32000, "Session terminated"))
             else:
-                self.session.call_tool = AsyncMock(
+                mock_session.call_tool = AsyncMock(
                     return_value=types.CallToolResult(content=[types.TextContent(type="text", text="recovered")])
                 )
             self.is_connected = True
@@ -2636,8 +2668,9 @@ async def test_mcp_tool_call_tool_raises_on_is_error():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2652,7 +2685,7 @@ async def test_mcp_tool_call_tool_raises_on_is_error():
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(
                     content=[types.TextContent(type="text", text="Something went wrong")],
                     is_error=True,
@@ -2676,8 +2709,9 @@ async def test_mcp_tool_call_tool_succeeds_when_is_error_false():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2692,7 +2726,7 @@ async def test_mcp_tool_call_tool_succeeds_when_is_error_false():
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(
                     content=[types.TextContent(type="text", text="Success")],
                     is_error=False,
@@ -2726,8 +2760,9 @@ async def test_mcp_tool_is_error_propagates_through_function_middleware():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2742,7 +2777,7 @@ async def test_mcp_tool_is_error_propagates_through_function_middleware():
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(
                     content=[types.TextContent(type="text", text="MCP error occurred")],
                     is_error=True,
@@ -2778,8 +2813,9 @@ async def test_local_mcp_server_prompt_execution():
 
     class TestMCPTool(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_prompts = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_prompts = AsyncMock(
                 return_value=types.ListPromptsResult(
                     prompts=[
                         types.Prompt(
@@ -2790,7 +2826,7 @@ async def test_local_mcp_server_prompt_execution():
                     ]
                 )
             )
-            self.session.get_prompt = AsyncMock(
+            mock_session.get_prompt = AsyncMock(
                 return_value=types.GetPromptResult(
                     description="Generated prompt",
                     messages=[
@@ -2841,8 +2877,9 @@ async def test_mcp_tool_approval_mode(approval_mode, expected_approvals):
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -2918,8 +2955,9 @@ async def test_mcp_tool_allowed_tools(allowed_tools, expected_count, expected_na
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -3075,9 +3113,10 @@ async def _load_progressive_test_server(
             approval_mode=approval_mode,
             use_progressive_disclosure=True,
         )
-    server.session = AsyncMock()
-    server.session.list_tools = AsyncMock(return_value=_progressive_tool_list_page(tools=tools))
-    server.session.call_tool = AsyncMock(
+    mock_session = AsyncMock()
+    server.session = mock_session
+    mock_session.list_tools = AsyncMock(return_value=_progressive_tool_list_page(tools=tools))
+    mock_session.call_tool = AsyncMock(
         return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
     )
     await server.load_tools()
@@ -3625,8 +3664,10 @@ def test_local_mcp_streamable_http_tool_init():
 
 
 def test_mcp_websocket_tool_is_deprecated() -> None:
+    from agent_framework import MCPWebsocketTool  # ty: ignore[deprecated]
+
     with pytest.warns(DeprecationWarning, match="MCP WebSocket transport was removed in MCP v2"):
-        tool = MCPWebsocketTool(name="test", url="ws://localhost:8080")  # pyright: ignore[reportDeprecated]
+        tool = MCPWebsocketTool(name="test", url="ws://localhost:8080")  # pyright: ignore[reportDeprecated]  # ty: ignore[deprecated]
 
     with pytest.raises(RuntimeError, match="Use MCPStreamableHTTPTool instead"):
         tool.get_mcp_client()
@@ -3807,8 +3848,8 @@ async def test_mcp_tool_refreshes_catalogs_from_modern_subscription() -> None:
     sdk_client = _mock_sdk_client(capabilities=capabilities, protocol_version="2026-07-28")
     sdk_client.listen = Mock(return_value=listen_context())
     tool = MCPStdioTool(name="test_tool", command="unused")
-    tool.load_tools = load_tools  # type: ignore[method-assign]
-    tool.load_prompts = load_prompts  # type: ignore[method-assign]
+    tool.load_tools = load_tools  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
+    tool.load_prompts = load_prompts  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
 
     with patch("mcp.Client", return_value=sdk_client):
         async with tool:
@@ -3974,8 +4015,8 @@ async def test_mcp_tool_uses_legacy_catalog_notifications_when_subscription_is_u
     sdk_client = _mock_sdk_client(capabilities=capabilities)
     sdk_client.listen = Mock(return_value=unsupported_listen())
     tool = MCPStdioTool(name="test_tool", command="unused")
-    tool.load_tools = load_tools  # type: ignore[method-assign]
-    tool.load_prompts = load_prompts  # type: ignore[method-assign]
+    tool.load_tools = load_tools  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
+    tool.load_prompts = load_prompts  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
 
     with patch("mcp.Client", return_value=sdk_client):
         async with tool:
@@ -4963,7 +5004,9 @@ async def test_connect_retains_and_close_clears_sdk_client() -> None:
             with pytest.raises(RuntimeError, match="framework-owned MCP Client"):
                 tool.session = None
             await tool.connect(reset=True)
-            assert tool._connection.client is sdk_client
+            reset_connection = tool._connection
+            assert reset_connection is not None
+            assert reset_connection.client is sdk_client
             assert tool.session is sdk_client.session
         finally:
             await tool.close()
@@ -5079,12 +5122,12 @@ async def test_catalog_loading_uses_sdk_client_cache() -> None:
             ]
 
     assert [awaited.kwargs for awaited in sdk_client.list_tools.await_args_list] == [
-        {"cursor": None, "cache_mode": "use"},
-        {"cursor": "tools-next", "cache_mode": "use"},
+        {"cursor": None},
+        {"cursor": "tools-next"},
     ]
     assert [awaited.kwargs for awaited in sdk_client.list_prompts.await_args_list] == [
-        {"cursor": None, "cache_mode": "use"},
-        {"cursor": "prompts-next", "cache_mode": "use"},
+        {"cursor": None},
+        {"cursor": "prompts-next"},
     ]
     session.list_tools.assert_not_awaited()
     session.list_prompts.assert_not_awaited()
@@ -5313,6 +5356,7 @@ async def test_authorization_identity_change_replaces_catalog_cache() -> None:
         body = json.loads(request.content)
         method = body["method"]
         principal = request.headers.get("Authorization", "")
+        result: dict[str, Any]
         if method == "server/discover":
             result = {
                 "supportedVersions": ["2026-07-28"],
@@ -6730,8 +6774,9 @@ async def test_mcp_tool_call_tool_requires_loaded_tools() -> None:
 async def test_generated_mcp_function_ignores_model_supplied_remote_tool_name() -> None:
     """A model-supplied argument must not be able to redirect the call to another remote tool."""
     tool = MCPTool(name="test_tool")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock(spec=ClientSession)
-    tool.session.list_tools = AsyncMock(  # ty: ignore[unresolved-attribute]
+    mock_session = Mock(spec=ClientSession)
+    tool.session = mock_session
+    mock_session.list_tools = AsyncMock(  # ty: ignore[unresolved-attribute]
         return_value=types.ListToolsResult(
             tools=[
                 types.Tool(
@@ -6755,7 +6800,7 @@ async def test_generated_mcp_function_ignores_model_supplied_remote_tool_name() 
             ]
         )
     )
-    tool.session.call_tool = AsyncMock(  # ty: ignore[unresolved-attribute]
+    mock_session.call_tool = AsyncMock(  # ty: ignore[unresolved-attribute]
         return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
     )
 
@@ -6766,8 +6811,8 @@ async def test_generated_mcp_function_ignores_model_supplied_remote_tool_name() 
         arguments={"query": "quarterly report", "_remote_tool_name": "delete_repo", "repo": "corp/prod"}
     )
 
-    tool.session.call_tool.assert_awaited_once()  # ty: ignore[unresolved-attribute]
-    await_args = tool.session.call_tool.await_args  # ty: ignore[unresolved-attribute]
+    mock_session.call_tool.assert_awaited_once()  # ty: ignore[unresolved-attribute]
+    await_args = mock_session.call_tool.await_args  # ty: ignore[unresolved-attribute]
     assert await_args is not None
     assert await_args.args[0] == "search_docs"
     assert await_args.kwargs["arguments"] == {"query": "quarterly report"}
@@ -6816,9 +6861,10 @@ async def test_mcp_tool_get_prompt_raises_after_reconnection_still_fails() -> No
 
 async def test_mcp_tool_wraps_unexpected_call_tool_and_get_prompt_errors() -> None:
     tool = MCPTool(name="test_tool", load_tools=True, load_prompts=True)  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock()
-    tool.session.call_tool = AsyncMock(side_effect=RuntimeError("tool boom"))
-    tool.session.get_prompt = AsyncMock(side_effect=RuntimeError("prompt boom"))
+    mock_session = Mock()
+    tool.session = mock_session
+    mock_session.call_tool = AsyncMock(side_effect=RuntimeError("tool boom"))
+    mock_session.get_prompt = AsyncMock(side_effect=RuntimeError("prompt boom"))
 
     with pytest.raises(ToolExecutionException, match="Failed to call tool 'remote_tool'"):
         await tool.call_tool("remote_tool")
@@ -7788,13 +7834,14 @@ async def test_connect_sets_logging_level_when_server_advertises_logging() -> No
 
 async def test_ensure_connected_skips_future_pings_when_ping_is_not_available() -> None:
     tool = MCPTool(name="test_tool")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = Mock(send_ping=AsyncMock(side_effect=MCPError(-32601, "Method 'ping' is not available.")))
+    mock_session = Mock(send_ping=AsyncMock(side_effect=MCPError(-32601, "Method 'ping' is not available.")))
+    tool.session = mock_session
 
     with patch.object(tool, "_reconnect_without_loading", AsyncMock()) as mock_reconnect:
         await tool._ensure_connected()
         await tool._ensure_connected()
 
-    tool.session.send_ping.assert_awaited_once()
+    mock_session.send_ping.assert_awaited_once()
     mock_reconnect.assert_not_awaited()
     assert tool._ping_available is False
 
@@ -7888,8 +7935,9 @@ async def test_mcp_tool_filters_framework_kwargs():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -7905,7 +7953,7 @@ async def test_mcp_tool_filters_framework_kwargs():
                 )
             )
             # Mock call_tool to capture the arguments it receives
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="Success")])
             )
 
@@ -7972,8 +8020,9 @@ async def test_mcp_tool_call_tool_otel_meta(use_span, expect_traceparent, span_e
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -7988,7 +8037,7 @@ async def test_mcp_tool_call_tool_otel_meta(use_span, expect_traceparent, span_e
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="result")])
             )
 
@@ -8033,8 +8082,9 @@ async def test_mcp_tool_call_tool_forwards_tool_list_meta():
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -8050,10 +8100,10 @@ async def test_mcp_tool_call_tool_forwards_tool_list_meta():
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="result")])
             )
-            self.session.list_prompts = AsyncMock(return_value=types.ListPromptsResult(prompts=[]))
+            mock_session.list_prompts = AsyncMock(return_value=types.ListPromptsResult(prompts=[]))
 
         def get_mcp_client(self) -> _AsyncGeneratorContextManager[Any, None]:
             return None  # type: ignore[return-value]  # pyrefly: ignore[bad-return]  # ty: ignore[invalid-return-type]
@@ -8078,8 +8128,9 @@ async def test_mcp_tool_call_tool_user_meta_merges_with_tool_list_meta():
 
     class TestServer(MCPTool):
         async def connect(self) -> None:  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -8091,7 +8142,7 @@ async def test_mcp_tool_call_tool_user_meta_merges_with_tool_list_meta():
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="result")])
             )
 
@@ -8121,8 +8172,9 @@ async def test_mcp_tool_function_invocation_strips_model_supplied_meta() -> None
 
     class TestServer(MCPTool):
         async def connect(self) -> None:  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -8133,7 +8185,7 @@ async def test_mcp_tool_function_invocation_strips_model_supplied_meta() -> None
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="result")])
             )
 
@@ -8165,8 +8217,9 @@ async def test_mcp_tool_function_invocation_preserves_trusted_meta_over_model_me
 
     class TestServer(MCPTool):
         async def connect(self) -> None:  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -8177,7 +8230,7 @@ async def test_mcp_tool_function_invocation_preserves_trusted_meta_over_model_me
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="result")])
             )
 
@@ -8216,8 +8269,9 @@ async def test_mcp_tool_call_tool_otel_meta_overrides_user_meta_but_not_tool_lis
 
     class TestServer(MCPTool):
         async def connect(self) -> None:  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -8229,7 +8283,7 @@ async def test_mcp_tool_call_tool_otel_meta_overrides_user_meta_but_not_tool_lis
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="result")])
             )
 
@@ -8335,7 +8389,9 @@ async def test_mcp_streamable_http_tool_header_provider_injects_headers():
         await server.call_tool("greet", name="Alice", some_token="my-secret")
 
         # Verify the high-level Client.call_tool was called.
-        sdk_client = server._connection.client
+        connection = server._connection
+        assert connection is not None
+        sdk_client = connection.client
         assert sdk_client is not None
         cast(AsyncMock, sdk_client.call_tool).assert_awaited_once()
 
@@ -8470,7 +8526,9 @@ async def test_mcp_streamable_http_tool_without_header_provider():
     async with server:
         await server.load_tools()
         await server.call_tool("greet", name="Alice")
-        sdk_client = server._connection.client
+        connection = server._connection
+        assert connection is not None
+        sdk_client = connection.client
         assert sdk_client is not None
         cast(AsyncMock, sdk_client.call_tool).assert_awaited_once()
 
@@ -8689,7 +8747,7 @@ async def test_mcp_streamable_http_tool_header_provider_ambient_non_keyerror_pro
 
 async def test_mcp_streamable_http_tool_header_provider_skips_cross_origin_redirect():
     """The request hook must not re-add caller headers after a cross-origin redirect."""
-    import httpx
+    import httpx2 as httpx
 
     from agent_framework._mcp import _mcp_call_headers
 
@@ -8735,7 +8793,7 @@ async def test_mcp_streamable_http_tool_header_provider_skips_cross_origin_redir
 
 async def test_mcp_streamable_http_tool_keeps_bound_headers_on_same_origin_redirect():
     """A redirected request must retain the header set bound to its session."""
-    import httpx
+    import httpx2 as httpx
 
     provider_headers = {"X-Previous": "old"}
     tool = MCPStreamableHTTPTool(
@@ -8784,7 +8842,7 @@ async def test_mcp_streamable_http_tool_keeps_bound_headers_on_same_origin_redir
 @pytest.mark.parametrize("use_header_provider", [False, True])
 async def test_mcp_streamable_http_tool_header_provider_with_user_httpx_client(use_header_provider: bool):
     """Supplied clients preserve configuration, cookie persistence, and ownership."""
-    import httpx
+    import httpx2 as httpx
 
     from agent_framework._mcp import _mcp_call_headers
 
@@ -8835,7 +8893,7 @@ async def test_mcp_streamable_http_tool_header_provider_with_user_httpx_client(u
 
 async def test_mcp_streamable_http_tool_header_provider_isolated_on_shared_httpx_client():
     """Each MCP transport must use its own headers when sharing an httpx client."""
-    import httpx
+    import httpx2 as httpx
 
     captured_headers: list[dict[str, str]] = []
 
@@ -8893,7 +8951,7 @@ async def test_mcp_streamable_http_tool_header_provider_isolated_on_shared_httpx
 
 async def test_mcp_streamable_http_tool_removes_header_hook_on_close():
     """Closing one tool must remove only its hook, and reconnecting must restore it."""
-    import httpx
+    import httpx2 as httpx
 
     user_client = httpx.AsyncClient()
     tool_a = MCPStreamableHTTPTool(
@@ -8930,7 +8988,7 @@ async def test_mcp_streamable_http_tool_removes_header_hook_on_close():
 
 async def test_mcp_streamable_http_tool_removes_hook_without_mutating_active_hook_list():
     """Closing one tool must not disrupt an in-progress iteration over shared hooks."""
-    import httpx
+    import httpx2 as httpx
 
     from agent_framework._mcp import _MCP_INJECTED_HEADER_KEYS_EXTENSION
 
@@ -8994,7 +9052,7 @@ async def test_mcp_streamable_http_tool_removes_hook_without_mutating_active_hoo
 
 async def test_mcp_streamable_http_tool_keeps_header_hook_until_cancelled_close_finishes():
     """Caller cancellation must not remove the hook while lifecycle teardown continues."""
-    import httpx
+    import httpx2 as httpx
 
     user_client = httpx.AsyncClient()
     tool = MCPStreamableHTTPTool(
@@ -9045,7 +9103,7 @@ async def test_mcp_streamable_http_tool_keeps_header_hook_until_cancelled_close_
 
 async def test_mcp_header_scoped_client_tags_send_requests():
     """The transport wrapper must identify requests sent through AsyncClient.send."""
-    import httpx
+    import httpx2 as httpx
 
     from agent_framework._mcp import _MCP_HEADER_OWNER_EXTENSION, _MCPHeaderScopedClient
 
@@ -9068,7 +9126,7 @@ async def test_mcp_header_scoped_client_tags_send_requests():
 
 async def test_mcp_header_scoped_client_delegates_unwrapped_attributes():
     """The transport wrapper must stay a drop-in for the caller's httpx client."""
-    import httpx
+    import httpx2 as httpx
 
     from agent_framework._mcp import _MCPHeaderScopedClient
 
@@ -9169,7 +9227,9 @@ async def test_mcp_streamable_http_tool_header_provider_via_invoke_with_context(
         assert provider_received[0]["some_token"] == "my-secret"
 
         # Verify Client.call_tool was called with the tool arguments (not the runtime kwargs).
-        sdk_client = server._connection.client
+        connection = server._connection
+        assert connection is not None
+        sdk_client = connection.client
         assert sdk_client is not None
         call_tool = cast(AsyncMock, sdk_client.call_tool)
         call_tool.assert_awaited_once()
@@ -9187,7 +9247,7 @@ async def test_agent_run_supplies_mcp_connect_headers(
     in-process mock HTTP endpoint and asserts that header_provider can use those
     credentials on the initialize request, before any tool invocation occurs.
     """
-    import httpx
+    import httpx2 as httpx
 
     captured_requests: list[tuple[str, str, dict[str, str]]] = []
 
@@ -9601,7 +9661,7 @@ async def test_agent_context_manager_authenticates_connect_with_closure_provider
     Pins that ``header_provider`` already covers construction-time credentials: entering the
     agent context connects before any run exists, and the server rejects unauthenticated calls.
     """
-    import httpx
+    import httpx2 as httpx
 
     captured_requests: list[tuple[str, dict[str, str]]] = []
 
@@ -9669,7 +9729,7 @@ async def test_constructor_supplied_mcp_tool_uses_run_credentials_on_lazy_connec
     Without the agent context manager the handshake is deferred to ``run()``, so the run's
     credentials are available and must reach ``header_provider``.
     """
-    import httpx
+    import httpx2 as httpx
 
     captured_requests: list[tuple[str, dict[str, str]]] = []
 
@@ -9739,7 +9799,7 @@ async def test_mcp_streamable_http_tool_header_provider_applies_across_transport
     drives the real transport against an in-process mock server and asserts the
     per-call Authorization header arrives on the tools/call HTTP request.
     """
-    import httpx
+    import httpx2 as httpx
 
     captured_requests: list[tuple[str, str, dict[str, str]]] = []
 
@@ -9866,8 +9926,10 @@ async def test_mcp_streamable_http_tool_header_provider_serializes_concurrent_ca
 
     class _TestServer(MCPStreamableHTTPTool):
         async def connect(self, *, reset: bool = False) -> None:
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            sdk_client = AsyncMock()
+            sdk_client.session = mock_session
+            sdk_client.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -9878,8 +9940,9 @@ async def test_mcp_streamable_http_tool_header_provider_serializes_concurrent_ca
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(side_effect=blocking_call_tool)
-            self.session.send_ping = AsyncMock()
+            sdk_client.call_tool = AsyncMock(side_effect=blocking_call_tool)
+            mock_session.send_ping = AsyncMock()
+            self._connection = _ClientMCPConnection(sdk_client)
             self.is_connected = True
 
         async def _reconnect_for_identity_change(self) -> None:
@@ -10042,7 +10105,8 @@ async def test_task_options_rejects_non_positive_default_ttl() -> None:
 
 async def test_load_tools_captures_task_support() -> None:
     tool = MCPTool(name="lro")  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = AsyncMock()
+    mock_session = AsyncMock()
+    tool.session = mock_session
     tool.load_tools_flag = True
 
     page = Mock()
@@ -10060,7 +10124,7 @@ async def test_load_tools_captures_task_support() -> None:
         ),
     ]
     page.next_cursor = None
-    tool.session.list_tools = AsyncMock(return_value=page)
+    mock_session.list_tools = AsyncMock(return_value=page)
 
     await tool.load_tools()
 
@@ -10117,10 +10181,11 @@ async def test_call_tool_routes_required_through_public_task_override() -> None:
             return await super().call_tool_as_task(tool_name, **kwargs)
 
     tool = OverriddenTaskTool()  # type: ignore[abstract]  # ty: ignore[call-non-callable]
-    tool.session = AsyncMock(spec=ClientSession)
+    mock_session = AsyncMock(spec=ClientSession)
+    tool.session = mock_session
     tool._tool_task_support_by_name["slow_op"] = "required"
     fallback_result = types.CallToolResult(content=[types.TextContent(type="text", text="fallback")])
-    tool.session.send_request = AsyncMock(  # type: ignore[method-assign, union-attr]  # ty: ignore[invalid-assignment]
+    mock_session.send_request = AsyncMock(  # type: ignore[method-assign, union-attr]  # ty: ignore[invalid-assignment]
         return_value=types.Result.model_validate(fallback_result.model_dump(by_alias=True, exclude_none=True))
     )
 
@@ -10849,7 +10914,7 @@ async def test_call_tool_as_task_max_wait_cancels_even_when_local_cancel_option_
 async def test_call_tool_as_task_poll_transient_request_timeout_keeps_polling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import httpx
+    import httpx2 as httpx
 
     from agent_framework import _mcp as _mcp_module
 
@@ -11368,8 +11433,9 @@ async def test_call_tool_forwards_only_declared_arguments() -> None:
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -11384,7 +11450,7 @@ async def test_call_tool_forwards_only_declared_arguments() -> None:
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
             )
 
@@ -11422,8 +11488,9 @@ async def test_call_tool_forwards_runtime_kwargs_the_server_declares() -> None:
 
     class TestServer(MCPTool):
         async def connect(self):  # type: ignore[override]  # pyrefly: ignore[bad-override]  # ty: ignore[invalid-method-override]
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            self.session = mock_session
+            mock_session.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -11442,7 +11509,7 @@ async def test_call_tool_forwards_runtime_kwargs_the_server_declares() -> None:
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            mock_session.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
             )
 
@@ -11482,8 +11549,10 @@ async def test_header_provider_reading_contextvar_keeps_credential_out_of_argume
 
     class TestServer(MCPStreamableHTTPTool):
         async def connect(self, *, reset: bool = False) -> None:
-            self.session = Mock(spec=ClientSession)
-            self.session.list_tools = AsyncMock(
+            mock_session = Mock(spec=ClientSession)
+            sdk_client = AsyncMock()
+            sdk_client.session = mock_session
+            sdk_client.list_tools = AsyncMock(
                 return_value=types.ListToolsResult(
                     tools=[
                         types.Tool(
@@ -11498,10 +11567,11 @@ async def test_header_provider_reading_contextvar_keeps_credential_out_of_argume
                     ]
                 )
             )
-            self.session.call_tool = AsyncMock(
+            sdk_client.call_tool = AsyncMock(
                 return_value=types.CallToolResult(content=[types.TextContent(type="text", text="sunny")])
             )
-            self.session.send_ping = AsyncMock()
+            mock_session.send_ping = AsyncMock()
+            self._connection = _ClientMCPConnection(sdk_client)
             self.is_connected = True
 
         async def _reconnect_for_identity_change(self) -> None:
@@ -11524,7 +11594,10 @@ async def test_header_provider_reading_contextvar_keeps_credential_out_of_argume
         context = FunctionInvocationContext(function=tool, arguments={"city": "Seattle"}, kwargs={})
         await tool.invoke(arguments={"city": "Seattle"}, context=context)
 
-        _, call_kwargs = server.session.call_tool.call_args  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+        connection = server._connection
+        assert connection is not None
+        assert connection.client is not None
+        _, call_kwargs = cast(AsyncMock, connection.client.call_tool).call_args
         assert seen_headers[-1] == {"Authorization": "Bearer secret-1"}
         assert call_kwargs["arguments"] == {"city": "Seattle"}
 
@@ -11543,7 +11616,7 @@ async def test_header_provider_reading_contextvar_keeps_credential_out_of_argume
 
 def _unauthorized_http_client() -> Any:
     """An HTTP client whose every response is 401, so `initialize` always fails."""
-    import httpx
+    import httpx2 as httpx
 
     return httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(401, request=request)))
 
